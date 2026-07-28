@@ -1,5 +1,6 @@
 import express from "express";
 import { supabaseAdmin, isDbConfigured } from "./supabase.js";
+import { identityEmail, validateRegistration } from "./phone.js";
 import {
   callbackSucceeded,
   isPayHeroConfigured,
@@ -20,6 +21,7 @@ import {
  * The routes keep their original paths, so the frontend switches over by
  * changing nothing but the origin it fetches:
  *
+ *   POST /api/auth/register              — create an account, pre-confirmed
  *   POST /api/payments/deposit           — signed-in customer raises an STK push
  *   POST /api/payments/payhero/callback  — PayHero reports the M-Pesa result
  *   GET  /health                         — Render's health check; also shows
@@ -101,6 +103,104 @@ app.get("/health", (_req, res) => {
     supabase: isDbConfigured(),
     payhero: isPayHeroConfigured(),
   });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/auth/register — create an account
+// ---------------------------------------------------------------------------
+
+/**
+ * Sign-in happens in the browser against Supabase directly; only *creation*
+ * comes through here, for one reason: the project has email confirmation on,
+ * and the identity address derived from a phone number is on a reserved
+ * domain that can never receive mail. A browser `signUp` would create an
+ * unconfirmed user, mail a link into the void, and strand the customer. The
+ * service role creates the user already confirmed.
+ *
+ * Creating a user is the only thing this route can do. It takes no role, no
+ * tier and no balance from the request — a registration endpoint that accepts
+ * a `live_tier` is a self-service VIP button.
+ *
+ * Rate-limited per address: account creation is the one unauthenticated write
+ * in the system. In-memory and therefore per-instance — enough for a single
+ * Render service.
+ */
+
+const REGISTER_WINDOW_MS = 10 * 60 * 1000;
+const REGISTER_MAX_ATTEMPTS = 8;
+const registerAttempts = new Map();
+
+function registerThrottled(key) {
+  const now = Date.now();
+  const entry = registerAttempts.get(key);
+
+  if (!entry || entry.resetAt <= now) {
+    registerAttempts.set(key, { count: 1, resetAt: now + REGISTER_WINDOW_MS });
+    return false;
+  }
+
+  entry.count += 1;
+  return entry.count > REGISTER_MAX_ATTEMPTS;
+}
+
+app.post("/api/auth/register", async (req, res) => {
+  const db = supabaseAdmin();
+  if (!db) {
+    return res
+      .status(503)
+      .json({ error: "Sign-up is unavailable — Supabase is not configured." });
+  }
+
+  const client =
+    (req.headers["x-forwarded-for"] ?? "").split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    "local";
+  if (registerThrottled(client)) {
+    return res
+      .status(429)
+      .json({ error: "Too many sign-up attempts. Try again later." });
+  }
+
+  const body = parseBody(req) ?? {};
+
+  // Re-run the same rules the form ran. The client's copy is there to give
+  // instant feedback; this one is the one that decides.
+  const validated = validateRegistration(
+    typeof body.phone === "string" ? body.phone : "",
+    typeof body.username === "string" ? body.username : "",
+    typeof body.password === "string" ? body.password : "",
+  );
+  if (!validated.ok) {
+    return res.status(400).json({ error: validated.reason });
+  }
+
+  const { phone, username, password } = validated.value;
+
+  const { error } = await db.auth.admin.createUser({
+    email: identityEmail(phone),
+    password,
+    // Pre-confirmed: nothing can be sent to the derived address, so waiting on
+    // a confirmation that will never arrive would strand the account.
+    email_confirm: true,
+    // `handle_new_user` reads these to populate `public.profiles`.
+    user_metadata: { phone, username },
+  });
+
+  if (error) {
+    // Supabase reports a duplicate as 422 "already been registered". Say what
+    // it means in the app's own terms; anything else is passed through as a
+    // server fault rather than as the customer's mistake.
+    const duplicate =
+      error.status === 422 || /already/i.test(error.message ?? "");
+
+    return res.status(duplicate ? 409 : 500).json({
+      error: duplicate
+        ? "An account already exists for this number"
+        : (error.message ?? "Could not create the account"),
+    });
+  }
+
+  return res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------------------

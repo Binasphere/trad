@@ -10,6 +10,7 @@ Render's environment), but there is no reason to publish it.
 
 | Route | Who calls it | What it does |
 | --- | --- | --- |
+| `POST /api/auth/register` | The sign-up form (anonymous, rate-limited) | Creates the Supabase user pre-confirmed via the service role |
 | `POST /api/payments/deposit` | The signed-in customer (Bearer token) | Books a PENDING cash event via `deposit_start`, raises the M-Pesa STK push |
 | `POST /api/payments/payhero/callback` | PayHero (HMAC-signed URL) | Settles the event via `deposit_settle`, which credits the balance |
 | `GET /health` | Render / you | Reports which of Supabase / PayHero is configured |
