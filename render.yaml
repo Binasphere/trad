@@ -1,0 +1,21 @@
+# Render blueprint — "New +" -> "Blueprint" and point it at this repo, or just
+# create a plain Web Service by hand with the same settings.
+services:
+  - type: web
+    name: meridian-payments
+    runtime: node
+    plan: starter # free works, but spins down when idle — see README
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false # prompted for in the dashboard, never stored in the repo
+      - key: AUTH_SECRET
+        sync: false
+      - key: PAYHERO_USERNAME
+        sync: false
+      - key: PAYHERO_PASSWORD
+        sync: false
+      - key: PAYHERO_CHANNEL_ID
+        sync: false
