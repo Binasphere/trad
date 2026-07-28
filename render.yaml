@@ -13,6 +13,8 @@ services:
         sync: false # prompted for in the dashboard, never stored in the repo
       - key: AUTH_SECRET
         sync: false
+      - key: ADMIN_PASSCODE
+        sync: false
       - key: PAYHERO_USERNAME
         sync: false
       - key: PAYHERO_PASSWORD

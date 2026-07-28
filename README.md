@@ -13,6 +13,7 @@ Render's environment), but there is no reason to publish it.
 | `POST /api/auth/register` | The sign-up form (anonymous, rate-limited) | Creates the Supabase user pre-confirmed via the service role |
 | `POST /api/payments/deposit` | The signed-in customer (Bearer token) | Books a PENDING cash event via `deposit_start`, raises the M-Pesa STK push |
 | `POST /api/payments/payhero/callback` | PayHero (HMAC-signed URL) | Settles the event via `deposit_settle`, which credits the balance |
+| `/api/admin/session`, `/api/admin/users`, `/api/admin/withdrawals` | The admin console (Bearer token from the passcode exchange) | User list, tier changes, and the manual withdrawal queue |
 | `GET /health` | Render / you | Reports which of Supabase / PayHero is configured |
 
 Because the callback lands here and settles straight into Supabase, deposits
@@ -28,6 +29,7 @@ polls Supabase for the settled row, not this service.
 3. In the service's **Environment** tab, set:
    - `SUPABASE_SERVICE_ROLE_KEY` — Supabase dashboard → Settings → API
    - `AUTH_SECRET` — the **same value** as the main app's `AUTH_SECRET`
+   - `ADMIN_PASSCODE` — the admin console's door; unset = admin API off
    - `PAYHERO_USERNAME`, `PAYHERO_PASSWORD` — PayHero dashboard → API Keys
    - `PAYHERO_CHANNEL_ID` — PayHero dashboard → Payment Channels (numeric id)
 4. Deploy. Open `https://<service>.onrender.com/health` — it must answer
