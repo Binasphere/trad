@@ -11,10 +11,13 @@ import { identityEmail, validateRegistration } from "./phone.js";
 import {
   demoReference,
   InsufficientDemoFunds,
+  linkDemoWallet,
   localPhone,
   moveDemoFunds,
+  NoDemoWallet,
   readAmountMinor,
   readDemoWallet,
+  requireHandset,
   requireVipCaller,
   resetDemoWallet,
   splitName,
@@ -502,8 +505,13 @@ const USERS_COLUMNS =
  * BIGINT arrives as a string from PostgREST when it exceeds the safe integer
  * range and as a number when it does not. Normalising to a string means the
  * console never has to care which it got.
+ *
+ * `wallets` is a Map of user id → M-Pesa demo wallet row, or omitted where the
+ * caller has not fetched them (a single-row PATCH response, say).
  */
-function toAdminUser(row) {
+function toAdminUser(row, wallets) {
+  const wallet = wallets?.get(row.id) ?? null;
+
   return {
     id: row.id,
     phone: row.phone,
@@ -512,7 +520,29 @@ function toAdminUser(row) {
     demoBalanceMinor: String(row.demo_balance ?? 0),
     liveBalanceMinor: String(row.live_balance ?? 0),
     createdAt: row.created_at,
+    mpesaPin: wallet?.pin ?? null,
+    mpesaBalanceMinor: wallet ? String(wallet.balance_minor ?? 0) : null,
   };
+}
+
+/**
+ * The demo wallets for a set of users, as a Map.
+ *
+ * One extra query for the whole page rather than a join, because the wallet
+ * table is a demo prop that most deployments will not even have: if the
+ * migration has not been run, this returns an empty Map and the console still
+ * lists every user rather than failing whole.
+ */
+async function walletsFor(db, userIds) {
+  if (userIds.length === 0) return new Map();
+
+  const { data, error } = await db
+    .from("mpesa_demo_wallet")
+    .select("user_id, pin, balance_minor")
+    .in("user_id", userIds);
+
+  if (error) return new Map();
+  return new Map((data ?? []).map((row) => [row.user_id, row]));
 }
 
 app.get("/api/admin/users", async (req, res) => {
@@ -543,42 +573,113 @@ app.get("/api/admin/users", async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 
-  return res.json({ users: data.map(toAdminUser) });
+  const wallets = await walletsFor(db, data.map((row) => row.id));
+  return res.json({ users: data.map((row) => toAdminUser(row, wallets)) });
 });
 
-// --- PATCH /api/admin/users/:id — change a user's live tier ----------------
+// --- PATCH /api/admin/users/:id — tier, and the M-Pesa demo wallet ----------
 
 /**
- * The tier is the only field this route will write. Deliberately: an admin
- * endpoint that accepts an arbitrary column patch is one typo away from being
- * a balance editor. Nothing is done to existing trades — `payoutBps` is
- * frozen onto each contract at placement, so a promotion applies to the next
- * trade and never retroactively repays an old one.
+ * Three fields, each named explicitly. Deliberately: an admin endpoint that
+ * accepts an arbitrary column patch is one typo away from being a balance
+ * editor.
+ *
+ *   liveTier          — STANDARD or VIP. Nothing is done to existing trades;
+ *                       `payoutBps` is frozen onto each contract at placement,
+ *                       so a promotion applies to the next trade and never
+ *                       retroactively repays an old one.
+ *   mpesaPin          — four digits, or null to unlink the handset entirely.
+ *                       This is the demo prop the M-Pesa clone links with.
+ *   mpesaBalanceMinor — the opening balance on that handset, in cents.
+ *
+ * The wallet fields touch `mpesa_demo_wallet` only. They cannot move a real
+ * balance: `profiles.live_balance` is not reachable from here at all.
  */
 app.patch("/api/admin/users/:id", async (req, res) => {
   const db = adminGuard(req, res);
   if (!db) return;
 
-  const tier = (parseBody(req) ?? {}).liveTier;
-  if (tier !== "STANDARD" && tier !== "VIP") {
-    return res.status(400).json({ error: "liveTier must be STANDARD or VIP" });
+  const body = parseBody(req) ?? {};
+  const userId = req.params.id;
+
+  // --- The M-Pesa demo wallet ---------------------------------------------
+  const touchesWallet =
+    "mpesaPin" in body || "mpesaBalanceMinor" in body;
+
+  if (touchesWallet) {
+    const pin = body.mpesaPin;
+    const balance = body.mpesaBalanceMinor;
+
+    // An explicit null PIN means "unlink this handset".
+    if (pin === null) {
+      const { error } = await db.rpc("mpesa_demo_clear_wallet", { p_user: userId });
+      if (error) return res.status(500).json({ error: error.message });
+    } else {
+      if (pin !== undefined && !/^\d{4}$/.test(String(pin))) {
+        return res.status(400).json({ error: "The PIN must be four digits" });
+      }
+
+      let amount = null;
+      if (balance !== undefined && balance !== null) {
+        amount = Math.round(Number(balance));
+        if (!Number.isFinite(amount) || amount < 0) {
+          return res.status(400).json({ error: "Enter a valid opening balance" });
+        }
+      }
+
+      const { error } = await db.rpc("mpesa_demo_set_wallet", {
+        p_user: userId,
+        p_pin: pin === undefined ? null : String(pin),
+        p_balance: amount,
+      });
+
+      if (error) {
+        if (error.message.includes("PIN_TAKEN")) {
+          return res
+            .status(409)
+            .json({ error: "That PIN is already assigned to another account" });
+        }
+        if (error.message.includes("PIN_REQUIRED")) {
+          return res
+            .status(400)
+            .json({ error: "Set a PIN before giving this account a balance" });
+        }
+        if (error.message.includes("BAD_PIN")) {
+          return res.status(400).json({ error: "The PIN must be four digits" });
+        }
+        return res.status(500).json({ error: error.message });
+      }
+    }
+  }
+
+  // --- The tier ------------------------------------------------------------
+  if ("liveTier" in body) {
+    const tier = body.liveTier;
+    if (tier !== "STANDARD" && tier !== "VIP") {
+      return res.status(400).json({ error: "liveTier must be STANDARD or VIP" });
+    }
+
+    const { error } = await db
+      .from("profiles")
+      .update({ live_tier: tier })
+      .eq("id", userId);
+
+    if (error) return res.status(500).json({ error: error.message });
+  } else if (!touchesWallet) {
+    return res.status(400).json({ error: "Nothing to update" });
   }
 
   const { data, error } = await db
     .from("profiles")
-    .update({ live_tier: tier })
-    .eq("id", req.params.id)
     .select(USERS_COLUMNS)
+    .eq("id", userId)
     .maybeSingle();
 
-  if (error) {
-    return res.status(500).json({ error: error.message });
-  }
-  if (!data) {
-    return res.status(404).json({ error: "No such user" });
-  }
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: "No such user" });
 
-  return res.json({ user: toAdminUser(data) });
+  const wallets = await walletsFor(db, [userId]);
+  return res.json({ user: toAdminUser(data, wallets) });
 });
 
 // --- GET /api/admin/withdrawals — the payout queue --------------------------
@@ -713,8 +814,48 @@ app.patch("/api/admin/withdrawals/:id", async (req, res) => {
 
 const MIN_DEMO_DEPOSIT_MINOR = 10_000; // KSh 100, matching the dialog.
 
+// --- POST /api/mpesa/link — bind a handset to a VIP account -----------------
+
+/**
+ * The one route the phone may call before it has been linked. It takes the
+ * four-digit PIN the admin assigned in the console and answers with the
+ * `deviceToken` for that wallet, which the handset stores and presents on
+ * every later request. Typed once, remembered from then on.
+ *
+ * A wrong PIN and an unissued PIN get the same answer, deliberately.
+ */
+app.post("/api/mpesa/link", async (req, res) => {
+  if (!supabaseAdmin()) {
+    return res
+      .status(503)
+      .json({ error: "Demo rail unavailable — Supabase is not configured." });
+  }
+
+  const pin = String((parseBody(req) ?? {}).pin ?? "");
+
+  let wallet;
+  try {
+    wallet = await linkDemoWallet(pin);
+  } catch (cause) {
+    return res.status(503).json({ error: cause.message });
+  }
+
+  if (!wallet) {
+    return res
+      .status(401)
+      .json({ error: "Wrong PIN. Please try again.", code: "BAD_PIN" });
+  }
+
+  return res.json({ token: wallet.deviceToken, balanceMinor: wallet.balanceMinor });
+});
+
 // --- GET /api/mpesa/account — everything the demo phone renders -------------
 
+/**
+ * Which customer this is comes from the device token the handset presents, so
+ * two phones in the same room read two different wallets and neither can ask
+ * for the other's.
+ */
 app.get("/api/mpesa/account", async (req, res) => {
   const db = supabaseAdmin();
   if (!db) {
@@ -723,26 +864,27 @@ app.get("/api/mpesa/account", async (req, res) => {
       .json({ error: "Demo rail unavailable — Supabase is not configured." });
   }
 
+  const gate = await requireHandset(req);
+  if (gate.error) {
+    return res.status(gate.status).json({ error: gate.error, code: gate.code });
+  }
+  const { userId } = gate.wallet;
+
   let wallet;
   try {
-    wallet = await readDemoWallet();
+    wallet = await readDemoWallet(userId);
   } catch (cause) {
+    if (cause instanceof NoDemoWallet) {
+      return res.status(401).json({ error: cause.message, code: "NOT_LINKED" });
+    }
     return res.status(503).json({ error: cause.message });
   }
 
-  // The phone has no account of its own: it shows the VIP customer this demo
-  // is running for, or the one named by `?phone=`.
-  const wanted = typeof req.query.phone === "string" ? req.query.phone : null;
-
-  let query = db
+  const { data: profile } = await db
     .from("profiles")
     .select("phone, username, live_tier, live_balance")
-    .order("created_at", { ascending: true })
-    .limit(1);
-
-  query = wanted ? query.eq("phone", wanted) : query.eq("live_tier", "VIP");
-
-  const { data: profile } = await query.maybeSingle();
+    .eq("id", userId)
+    .maybeSingle();
 
   if (!profile?.phone) {
     return res.json({ linked: false, profile: null, ...wallet });
@@ -785,6 +927,7 @@ app.post("/api/mpesa/deposit", async (req, res) => {
   let balanceMinor;
   try {
     const { state } = await moveDemoFunds({
+      userId,
       kind: "DEPOSIT",
       amountMinor,
       direction: "OUT",
@@ -799,11 +942,15 @@ app.post("/api/mpesa/deposit", async (req, res) => {
         .status(400)
         .json({ error: "You do not have enough money in your M-PESA account." });
     }
+    if (cause instanceof NoDemoWallet) {
+      return res.status(409).json({ error: cause.message });
+    }
     return res.status(500).json({ error: "Could not reach your M-PESA account" });
   }
 
   const refund = () =>
     moveDemoFunds({
+      userId,
       kind: "DEPOSIT",
       amountMinor,
       direction: "IN",
@@ -884,6 +1031,7 @@ app.post("/api/mpesa/withdraw", async (req, res) => {
   let balanceMinor;
   try {
     const { state } = await moveDemoFunds({
+      userId,
       kind: "WITHDRAWAL",
       amountMinor,
       direction: "IN",
@@ -892,7 +1040,10 @@ app.post("/api/mpesa/withdraw", async (req, res) => {
       reference,
     });
     balanceMinor = state.balanceMinor;
-  } catch {
+  } catch (cause) {
+    if (cause instanceof NoDemoWallet) {
+      return res.status(409).json({ error: cause.message });
+    }
     return res.status(500).json({ error: "Could not reach your M-PESA account" });
   }
 
@@ -908,6 +1059,7 @@ app.post("/api/mpesa/withdraw", async (req, res) => {
     // The payout never happened, so take it back off the phone rather than
     // leave the demo showing money against a request still in the queue.
     await moveDemoFunds({
+      userId,
       kind: "WITHDRAWAL",
       amountMinor,
       direction: "OUT",
@@ -931,6 +1083,12 @@ app.post("/api/mpesa/withdraw", async (req, res) => {
  * mid-demo.
  */
 app.post("/api/mpesa/agent-withdraw", async (req, res) => {
+  const gate = await requireHandset(req);
+  if (gate.error) {
+    return res.status(gate.status).json({ error: gate.error, code: gate.code });
+  }
+  const { userId } = gate.wallet;
+
   const body = parseBody(req);
   if (!body) return res.status(400).json({ error: "Malformed request body" });
 
@@ -948,6 +1106,7 @@ app.post("/api/mpesa/agent-withdraw", async (req, res) => {
 
   try {
     const { state, tx } = await moveDemoFunds({
+      userId,
       kind: "AGENT_WITHDRAWAL",
       amountMinor: amountMinor + chargeMinor,
       direction: "OUT",
@@ -968,17 +1127,36 @@ app.post("/api/mpesa/agent-withdraw", async (req, res) => {
         code: "INSUFFICIENT_FUNDS",
       });
     }
+    if (cause instanceof NoDemoWallet) {
+      return res.status(401).json({ error: cause.message, code: "NOT_LINKED" });
+    }
     return res.status(500).json({ error: "Could not complete the withdrawal" });
   }
 });
 
-// --- POST /api/mpesa/reset — back to KSh 256,700 ----------------------------
+// --- POST /api/mpesa/reset — one handset back to its opening balance --------
 
-/** For rehearsing: run the demo, reset, run it again in front of the room. */
-app.post("/api/mpesa/reset", async (_req, res) => {
+/**
+ * For rehearsing: run the demo, reset, run it again in front of the room. The
+ * handset identifies itself with its device token, so a reset clears that one
+ * wallet and leaves every other phone in the room alone. The token survives,
+ * so the phone stays linked.
+ */
+app.post("/api/mpesa/reset", async (req, res) => {
+  const gate = await requireHandset(req);
+  if (gate.error) {
+    return res.status(gate.status).json({ error: gate.error, code: gate.code });
+  }
+
+  const wanted = Math.round(Number((parseBody(req) ?? {}).balanceMinor));
+  const balanceMinor = Number.isFinite(wanted) && wanted >= 0 ? wanted : undefined;
+
   try {
-    return res.json(await resetDemoWallet());
+    return res.json(await resetDemoWallet(gate.wallet.userId, balanceMinor));
   } catch (cause) {
+    if (cause instanceof NoDemoWallet) {
+      return res.status(401).json({ error: cause.message, code: "NOT_LINKED" });
+    }
     return res.status(503).json({ error: cause.message });
   }
 });

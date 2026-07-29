@@ -1,21 +1,20 @@
 import { supabaseAdmin } from "./supabase.js";
 
 /**
- * The demo M-Pesa wallet — a port of `src/lib/server/mpesaWallet.ts` from the
+ * The demo M-Pesa wallets — a port of `src/lib/server/mpesaWallet.ts` from the
  * main Venti repository. Both copies drive the same Supabase tables
  * (`mpesa_demo_wallet`, `mpesa_demo_tx`, see `supabase/mpesa-demo.sql` there),
  * which is the whole point: the terminal may be running on a laptop or on the
  * deployed site, and the handset must see the same balance either way.
  *
- * A VIP account's cash movements settle against the companion M-Pesa clone app
- * instead of PayHero, so a deposit can be shown landing on a phone in the room.
+ * Each VIP has their own wallet. The admin assigns a PIN and an opening balance
+ * from the console; the customer types that PIN into the M-Pesa clone once and
+ * the handset keeps the `device_token` it is given from then on.
+ *
  * It is a **presentation rail and nothing else** — it touches no PayHero
  * credential and moves no real money. Real cash moves only on the Standard
  * path: a genuine STK push settled by the callback.
  */
-
-/** KSh 256,700.00 — where the phone starts before anything is demonstrated. */
-export const DEMO_START_BALANCE_MINOR = 25_670_000;
 
 /** Newest first, and only as long as any statement screen will show. */
 const MAX_HISTORY = 60;
@@ -44,6 +43,16 @@ export class InsufficientDemoFunds extends Error {
   }
 }
 
+/** Thrown when the account has no wallet — the admin has not set one up. */
+export class NoDemoWallet extends Error {
+  constructor() {
+    super(
+      "No M-PESA demo wallet for this account. An admin sets the PIN and opening balance in the console.",
+    );
+    this.name = "NoDemoWallet";
+  }
+}
+
 const CODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 /** An M-Pesa-shaped receipt, e.g. `TIL4KX92MB`. */
@@ -55,31 +64,108 @@ export function demoReference() {
   return out;
 }
 
-async function readStatement(db) {
-  const { data } = await db
+function db() {
+  const client = supabaseAdmin();
+  if (!client) throw new Error("Supabase is not configured");
+  return client;
+}
+
+// ---------------------------------------------------------------------------
+// Linking
+// ---------------------------------------------------------------------------
+
+/**
+ * Exchanges a PIN for the wallet it opens, or null when none does.
+ *
+ * The caller must not distinguish "wrong PIN" from "no such PIN" in what it
+ * sends back — one answer for both is what stops the handset being used to
+ * enumerate which PINs have been issued.
+ */
+export async function linkDemoWallet(pin) {
+  if (!/^\d{4}$/.test(pin)) return null;
+
+  const { data, error } = await db().rpc("mpesa_demo_link", { p_pin: pin });
+  if (error) throw new Error(error.message);
+  return data ?? null;
+}
+
+/** The wallet a handset's device token identifies, or null when unknown. */
+export async function walletByToken(token) {
+  if (!/^[0-9a-f-]{36}$/i.test(token)) return null;
+
+  const { data, error } = await db().rpc("mpesa_demo_by_token", { p_token: token });
+  if (error) throw new Error(error.message);
+  return data ?? null;
+}
+
+/**
+ * Resolves the handset's device token to the wallet it may act on.
+ *
+ * Returns either `{ wallet }` or `{ status, error }` for the route to send
+ * back. The token is the phone's whole identity: it was issued when the
+ * admin-assigned PIN was accepted, and it scopes every read and every agent
+ * withdrawal to that one wallet.
+ */
+export async function requireHandset(req) {
+  const token =
+    (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "") ||
+    (typeof req.query?.token === "string" ? req.query.token : "") ||
+    "";
+
+  if (!token) {
+    return { status: 401, error: "This phone is not linked yet.", code: "NOT_LINKED" };
+  }
+
+  let wallet;
+  try {
+    wallet = await walletByToken(token);
+  } catch (cause) {
+    return { status: 503, error: cause.message };
+  }
+
+  if (!wallet) {
+    // The admin cleared the wallet, or this token belongs to a project the
+    // phone is no longer pointed at. Either way it must re-link.
+    return { status: 401, error: "This phone is no longer linked.", code: "NOT_LINKED" };
+  }
+
+  return { wallet };
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+async function statement(userId) {
+  const { data } = await db()
     .from("mpesa_demo_tx")
     .select(TX_COLUMNS)
+    .eq("user_id", userId)
     .order("created_at", { ascending: false })
     .limit(MAX_HISTORY);
 
   return (data ?? []).map(toTx);
 }
 
-/** The wallet as it stands, with the recent statement. */
-export async function readDemoWallet() {
-  const db = supabaseAdmin();
-  if (!db) throw new Error("Supabase is not configured");
-
+/** One VIP's wallet as it stands, with their recent statement. */
+export async function readDemoWallet(userId) {
   const [{ data: wallet }, transactions] = await Promise.all([
-    db.from("mpesa_demo_wallet").select("balance_minor").eq("id", true).maybeSingle(),
-    readStatement(db),
+    db()
+      .from("mpesa_demo_wallet")
+      .select("balance_minor")
+      .eq("user_id", userId)
+      .maybeSingle(),
+    statement(userId),
   ]);
 
-  return {
-    balanceMinor: Number(wallet?.balance_minor ?? DEMO_START_BALANCE_MINOR),
-    transactions,
-  };
+  if (!wallet) throw new NoDemoWallet();
+
+  return { balanceMinor: Number(wallet.balance_minor), transactions };
 }
+
+// ---------------------------------------------------------------------------
+// Movement
+// ---------------------------------------------------------------------------
 
 /**
  * Applies one movement and returns the wallet as it stands afterwards.
@@ -89,13 +175,11 @@ export async function readDemoWallet() {
  * depositing while the phone withdraws) serialise there rather than racing.
  */
 export async function moveDemoFunds(movement) {
-  const db = supabaseAdmin();
-  if (!db) throw new Error("Supabase is not configured");
-
   const amount = Math.round(movement.amountMinor);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("BAD_AMOUNT");
 
-  const { data, error } = await db.rpc("mpesa_demo_move", {
+  const { data, error } = await db().rpc("mpesa_demo_move", {
+    p_user: movement.userId,
     p_kind: movement.kind,
     p_amount: amount,
     p_direction: movement.direction,
@@ -105,9 +189,8 @@ export async function moveDemoFunds(movement) {
   });
 
   if (error) {
-    if (error.message.includes("INSUFFICIENT_FUNDS")) {
-      throw new InsufficientDemoFunds();
-    }
+    if (error.message.includes("INSUFFICIENT_FUNDS")) throw new InsufficientDemoFunds();
+    if (error.message.includes("NO_WALLET")) throw new NoDemoWallet();
     throw new Error(error.message);
   }
 
@@ -116,24 +199,25 @@ export async function moveDemoFunds(movement) {
       balanceMinor: Number(data.balanceMinor),
       // Re-read rather than appended to locally, so what comes back reflects
       // anything the phone booked while this movement was in flight.
-      transactions: await readStatement(db),
+      transactions: await statement(movement.userId),
     },
     tx: toTx(data.tx),
   };
 }
 
-/** Puts the phone back to its opening balance with an empty statement. */
-export async function resetDemoWallet() {
-  const db = supabaseAdmin();
-  if (!db) throw new Error("Supabase is not configured");
+/** Puts one phone back to a chosen balance with an empty statement. */
+export async function resetDemoWallet(userId, balanceMinor) {
+  const { data, error } = await db().rpc("mpesa_demo_reset", {
+    p_user: userId,
+    p_balance: balanceMinor ?? null,
+  });
 
-  const { data, error } = await db.rpc("mpesa_demo_reset");
-  if (error) throw new Error(error.message);
+  if (error) {
+    if (error.message.includes("NO_WALLET")) throw new NoDemoWallet();
+    throw new Error(error.message);
+  }
 
-  return {
-    balanceMinor: Number(data ?? DEMO_START_BALANCE_MINOR),
-    transactions: [],
-  };
+  return { balanceMinor: Number(data), transactions: [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -149,8 +233,8 @@ export async function resetDemoWallet() {
  * back — callers write `if (gate.error) return res.status(gate.status)…`.
  */
 export async function requireVipCaller(req) {
-  const db = supabaseAdmin();
-  if (!db) {
+  const client = supabaseAdmin();
+  if (!client) {
     return {
       status: 503,
       error: "Demo rail unavailable — Supabase is not configured.",
@@ -160,10 +244,10 @@ export async function requireVipCaller(req) {
   const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
   if (!token) return { status: 401, error: "Not signed in" };
 
-  const { data: auth, error } = await db.auth.getUser(token);
+  const { data: auth, error } = await client.auth.getUser(token);
   if (error || !auth.user) return { status: 401, error: "Not signed in" };
 
-  const { data: profile } = await db
+  const { data: profile } = await client
     .from("profiles")
     .select("phone, username, live_tier")
     .eq("id", auth.user.id)
@@ -179,7 +263,7 @@ export async function requireVipCaller(req) {
 
   return {
     caller: {
-      db,
+      db: client,
       userId: auth.user.id,
       phone: profile.phone ?? "",
       username: profile.username ?? null,
