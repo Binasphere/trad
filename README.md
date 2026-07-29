@@ -1,6 +1,6 @@
-# Meridian payments backend
+# Venti payments backend
 
-The two money-moving HTTP endpoints from the main Meridian app, split into
+The two money-moving HTTP endpoints from the main Venti app, split into
 their own service so the payment secrets and the publicly reachable PayHero
 callback live on one small host. Everything else — accounts, balances,
 withdrawals, the admin panel — stays in Supabase and the main app.

@@ -9,6 +9,17 @@ import {
 } from "./admin.js";
 import { identityEmail, validateRegistration } from "./phone.js";
 import {
+  demoReference,
+  InsufficientDemoFunds,
+  localPhone,
+  moveDemoFunds,
+  readAmountMinor,
+  readDemoWallet,
+  requireVipCaller,
+  resetDemoWallet,
+  splitName,
+} from "./mpesa.js";
+import {
   callbackSucceeded,
   isPayHeroConfigured,
   signCallback,
@@ -17,7 +28,7 @@ import {
 } from "./payhero.js";
 
 /**
- * Meridian payments backend.
+ * Venti payments backend.
  *
  * The two money-moving HTTP endpoints from the main app, extracted so they can
  * live on a small always-public host (Render) while the app itself is served
@@ -679,10 +690,304 @@ app.patch("/api/admin/withdrawals/:id", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// The VIP demo M-Pesa rail — /api/mpesa/*
+// ---------------------------------------------------------------------------
+
+/**
+ * The companion M-Pesa clone app stands in for a real handset during a demo:
+ * a VIP account deposits and the money leaves the phone's balance; it
+ * withdraws and the money arrives back, with no admin queue in between.
+ *
+ * These are ports of the same routes in the main app under
+ * `src/app/api/mpesa/*`. Both copies exist deliberately: the main app's serve
+ * a laptop running `npm run dev` (fast, no cold start), these serve a deployed
+ * terminal and the handset itself, which has no LAN route to anyone's laptop.
+ * They drive one Supabase wallet, so the two can never disagree.
+ *
+ * The customer-facing pair are gated on the VIP tier read from `profiles`. The
+ * phone's own routes (`/account`, `/agent-withdraw`, `/reset`) are open,
+ * because the handset has no session to present — what they expose is the demo
+ * account's number and a prop balance, and no real balance is reachable
+ * through them.
+ */
+
+const MIN_DEMO_DEPOSIT_MINOR = 10_000; // KSh 100, matching the dialog.
+
+// --- GET /api/mpesa/account — everything the demo phone renders -------------
+
+app.get("/api/mpesa/account", async (req, res) => {
+  const db = supabaseAdmin();
+  if (!db) {
+    return res
+      .status(503)
+      .json({ error: "Demo rail unavailable — Supabase is not configured." });
+  }
+
+  let wallet;
+  try {
+    wallet = await readDemoWallet();
+  } catch (cause) {
+    return res.status(503).json({ error: cause.message });
+  }
+
+  // The phone has no account of its own: it shows the VIP customer this demo
+  // is running for, or the one named by `?phone=`.
+  const wanted = typeof req.query.phone === "string" ? req.query.phone : null;
+
+  let query = db
+    .from("profiles")
+    .select("phone, username, live_tier, live_balance")
+    .order("created_at", { ascending: true })
+    .limit(1);
+
+  query = wanted ? query.eq("phone", wanted) : query.eq("live_tier", "VIP");
+
+  const { data: profile } = await query.maybeSingle();
+
+  if (!profile?.phone) {
+    return res.json({ linked: false, profile: null, ...wallet });
+  }
+
+  return res.json({
+    linked: true,
+    profile: {
+      phone: localPhone(profile.phone),
+      liveTier: profile.live_tier,
+      ...splitName(profile.username, profile.phone),
+    },
+    tradingBalanceMinor: Number(profile.live_balance ?? 0),
+    ...wallet,
+  });
+});
+
+// --- POST /api/mpesa/deposit — VIP deposit, settled against the phone -------
+
+/**
+ * Where the Standard path raises a real STK push and waits for PayHero's
+ * callback, this debits the demo wallet and settles immediately.
+ *
+ * The debit happens first. If booking or settling the deposit then fails the
+ * phone is refunded, so a failure cannot leave the demo down a balance it
+ * never traded with.
+ */
+app.post("/api/mpesa/deposit", async (req, res) => {
+  const gate = await requireVipCaller(req);
+  if (gate.error) return res.status(gate.status).json({ error: gate.error });
+  const { db, userId, phone } = gate.caller;
+
+  const parsed = readAmountMinor(parseBody(req), MIN_DEMO_DEPOSIT_MINOR);
+  if (parsed.error) return res.status(parsed.status).json({ error: parsed.error });
+  const { amountMinor } = parsed;
+
+  const reference = demoReference();
+
+  // --- Take it off the phone ----------------------------------------------
+  let balanceMinor;
+  try {
+    const { state } = await moveDemoFunds({
+      kind: "DEPOSIT",
+      amountMinor,
+      direction: "OUT",
+      title: "Pay to Venti",
+      subtitle: "Trading deposit",
+      reference,
+    });
+    balanceMinor = state.balanceMinor;
+  } catch (cause) {
+    if (cause instanceof InsufficientDemoFunds) {
+      return res
+        .status(400)
+        .json({ error: "You do not have enough money in your M-PESA account." });
+    }
+    return res.status(500).json({ error: "Could not reach your M-PESA account" });
+  }
+
+  const refund = () =>
+    moveDemoFunds({
+      kind: "DEPOSIT",
+      amountMinor,
+      direction: "IN",
+      title: "Reversal — Venti",
+      subtitle: "Deposit could not be completed",
+    }).catch(() => undefined);
+
+  // --- Put it on the live balance -----------------------------------------
+  const { data: eventId, error: startError } = await db.rpc("deposit_start", {
+    p_user: userId,
+    p_amount: amountMinor,
+    p_phone: phone,
+  });
+
+  if (startError || typeof eventId !== "string") {
+    await refund();
+    return res.status(500).json({ error: "Could not start the deposit" });
+  }
+
+  const { data: settled, error: settleError } = await db.rpc("deposit_settle", {
+    p_event: eventId,
+    p_success: true,
+    p_reference: reference,
+    p_failure: null,
+  });
+
+  if (settleError || settled !== true) {
+    await db.rpc("deposit_settle", {
+      p_event: eventId,
+      p_success: false,
+      p_reference: null,
+      p_failure: "Demo rail could not settle",
+    });
+    await refund();
+    return res.status(500).json({ error: "Could not complete the deposit" });
+  }
+
+  return res.json({ id: eventId, reference, balanceMinor });
+});
+
+// --- POST /api/mpesa/withdraw — pays a VIP withdrawal onto the phone --------
+
+/**
+ * The request itself is raised by the browser through `withdrawal_request`,
+ * which debits the live balance and books a PENDING event atomically. This
+ * route is the payout half: on the Standard path an admin sends the money by
+ * hand, and on the demo rail the phone plays that part.
+ *
+ * The body carries only the event id. Amount and recipient are read from the
+ * booked row, never from the request, so the caller cannot ask to be paid more
+ * than they queued.
+ */
+app.post("/api/mpesa/withdraw", async (req, res) => {
+  const gate = await requireVipCaller(req);
+  if (gate.error) return res.status(gate.status).json({ error: gate.error });
+  const { db, userId } = gate.caller;
+
+  const eventId = String(parseBody(req)?.eventId ?? "");
+  if (!eventId) return res.status(400).json({ error: "Missing withdrawal id" });
+
+  const { data: event } = await db
+    .from("cash_events")
+    .select("id, user_id, kind, status, amount_minor")
+    .eq("id", eventId)
+    .maybeSingle();
+
+  if (!event || event.user_id !== userId) {
+    return res.status(404).json({ error: "Withdrawal not found" });
+  }
+  if (event.kind !== "WITHDRAWAL" || event.status !== "PENDING") {
+    return res.status(409).json({ error: "That withdrawal is no longer pending" });
+  }
+
+  const amountMinor = Number(event.amount_minor);
+  const reference = demoReference();
+
+  // --- Money onto the phone ------------------------------------------------
+  let balanceMinor;
+  try {
+    const { state } = await moveDemoFunds({
+      kind: "WITHDRAWAL",
+      amountMinor,
+      direction: "IN",
+      title: "Receive from Venti",
+      subtitle: "Trading withdrawal",
+      reference,
+    });
+    balanceMinor = state.balanceMinor;
+  } catch {
+    return res.status(500).json({ error: "Could not reach your M-PESA account" });
+  }
+
+  // --- Approve the request -------------------------------------------------
+  const { data: decided, error } = await db.rpc("withdrawal_decide", {
+    p_event: eventId,
+    p_approve: true,
+    p_reference: reference,
+    p_reason: null,
+  });
+
+  if (error || decided !== true) {
+    // The payout never happened, so take it back off the phone rather than
+    // leave the demo showing money against a request still in the queue.
+    await moveDemoFunds({
+      kind: "WITHDRAWAL",
+      amountMinor,
+      direction: "OUT",
+      title: "Reversal — Venti",
+      subtitle: "Withdrawal could not be completed",
+    }).catch(() => undefined);
+
+    return res.status(500).json({ error: "Could not complete the withdrawal" });
+  }
+
+  return res.json({ reference, balanceMinor });
+});
+
+// --- POST /api/mpesa/agent-withdraw — the phone's own agent withdrawal ------
+
+/**
+ * Nothing to do with the trading account: this is the demo phone spending its
+ * demo balance at a demo agent. It lives here only so that one wallet remains
+ * the single balance both apps read — a withdrawal made on the handset has to
+ * be visible the next time the terminal deposits, or the two drift apart
+ * mid-demo.
+ */
+app.post("/api/mpesa/agent-withdraw", async (req, res) => {
+  const body = parseBody(req);
+  if (!body) return res.status(400).json({ error: "Malformed request body" });
+
+  const amountMinor = Math.round(Number(body.amountMinor));
+  const chargeMinor = Math.round(Number(body.chargeMinor ?? 0));
+  const agentNumber = String(body.agentNumber ?? "");
+  const agentName = String(body.agentName ?? "Agent");
+
+  if (!Number.isFinite(amountMinor) || amountMinor <= 0) {
+    return res.status(400).json({ error: "Enter an amount" });
+  }
+  if (!Number.isFinite(chargeMinor) || chargeMinor < 0) {
+    return res.status(400).json({ error: "Bad charge" });
+  }
+
+  try {
+    const { state, tx } = await moveDemoFunds({
+      kind: "AGENT_WITHDRAWAL",
+      amountMinor: amountMinor + chargeMinor,
+      direction: "OUT",
+      title: `Withdraw from ${agentName}`,
+      subtitle: agentNumber ? `Agent ${agentNumber}` : "Agent withdrawal",
+    });
+
+    return res.json({
+      reference: tx.reference,
+      balanceMinor: state.balanceMinor,
+      at: tx.at,
+    });
+  } catch (cause) {
+    if (cause instanceof InsufficientDemoFunds) {
+      return res.status(400).json({
+        error:
+          "You do not have enough money in your M-PESA account to complete this transaction.",
+        code: "INSUFFICIENT_FUNDS",
+      });
+    }
+    return res.status(500).json({ error: "Could not complete the withdrawal" });
+  }
+});
+
+// --- POST /api/mpesa/reset — back to KSh 256,700 ----------------------------
+
+/** For rehearsing: run the demo, reset, run it again in front of the room. */
+app.post("/api/mpesa/reset", async (_req, res) => {
+  try {
+    return res.json(await resetDemoWallet());
+  } catch (cause) {
+    return res.status(503).json({ error: cause.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 
 const port = Number(process.env.PORT) || 8790;
 app.listen(port, () => {
   console.log(
-    `meridian-payments listening on :${port} — supabase ${isDbConfigured() ? "ok" : "MISSING"}, payhero ${isPayHeroConfigured() ? "ok" : "MISSING"}`,
+    `venti-payments listening on :${port} — supabase ${isDbConfigured() ? "ok" : "MISSING"}, payhero ${isPayHeroConfigured() ? "ok" : "MISSING"}`,
   );
 });

@@ -1,8 +1,8 @@
 {
-  "name": "meridian-payments",
+  "name": "venti-payments",
   "version": "1.0.0",
   "private": true,
-  "description": "Meridian payments backend — PayHero M-Pesa deposits, split out of the main app so the secrets and the public callback live on one small host (Render).",
+  "description": "Venti payments backend — PayHero M-Pesa deposits, split out of the main app so the secrets and the public callback live on one small host (Render).",
   "type": "module",
   "engines": {
     "node": ">=20"

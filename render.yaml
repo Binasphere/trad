@@ -2,6 +2,8 @@
 # create a plain Web Service by hand with the same settings.
 services:
   - type: web
+    # Left as-is: the live service was provisioned under this name, and Render
+    # treats a renamed blueprint service as a new one to create.
     name: meridian-payments
     runtime: node
     plan: starter # free works, but spins down when idle — see README

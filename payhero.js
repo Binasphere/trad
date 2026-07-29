@@ -3,7 +3,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 /**
  * PayHero (payhero.co.ke) — M-Pesa STK push.
  *
- * A near-verbatim port of `src/lib/payments/payhero.ts` from the main Meridian
+ * A near-verbatim port of `src/lib/payments/payhero.ts` from the main Venti
  * repository, with one difference: secrets come from the environment only.
  * This service runs on Render, where env vars are the native way to configure
  * a deployment, so the `secrets.local.json` fallback the main repo carries for

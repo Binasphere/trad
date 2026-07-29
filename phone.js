@@ -1,6 +1,6 @@
 /**
  * Phone identity and account validation — a port of `src/lib/phone.ts` from
- * the main Meridian repository. The rules must match exactly: the browser
+ * the main Venti repository. The rules must match exactly: the browser
  * form runs its copy for instant feedback, and this copy is the one whose
  * verdict counts.
  */
@@ -25,7 +25,12 @@ export function normalisePhone(input) {
 /**
  * The number carried as a Supabase Auth email identity. `.invalid` is the
  * RFC 2606 reserved TLD — guaranteed never to resolve, so a stray mail can
- * never reach a real inbox. Must match the main app's `IDENTITY_DOMAIN`.
+ * never reach a real inbox.
+ *
+ * Deliberately still `meridian.invalid` after the rename to Venti, and it must
+ * stay byte-identical to `IDENTITY_DOMAIN` in the main app's `src/lib/phone.ts`
+ * — this service *creates* the auth user and the browser *signs in* as it. If
+ * the two disagree, every account registered here can never sign in there.
  */
 const IDENTITY_DOMAIN = "meridian.invalid";
 
