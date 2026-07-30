@@ -894,7 +894,6 @@ app.get("/api/mpesa/account", async (req, res) => {
     linked: true,
     profile: {
       phone: localPhone(profile.phone),
-      liveTier: profile.live_tier,
       ...splitName(profile.username, profile.phone),
     },
     tradingBalanceMinor: Number(profile.live_balance ?? 0),

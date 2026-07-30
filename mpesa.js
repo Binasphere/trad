@@ -257,7 +257,10 @@ export async function requireVipCaller(req) {
   if (profile.live_tier !== "VIP") {
     return {
       status: 403,
-      error: "The M-Pesa demo rail is available to VIP accounts only.",
+      // Neutral on purpose: the tier is an internal classification and the
+      // customer is never told which one they are on, so the refusal must not
+      // be the thing that tells them.
+      error: "This payment method is not available on your account.",
     };
   }
 
