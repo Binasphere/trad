@@ -7,7 +7,15 @@ import {
   verifyPasscode,
   verifyToken,
 } from "./admin.js";
-import { identityEmail, validateRegistration } from "./phone.js";
+import { identityEmail, normalisePhone, validateRegistration } from "./phone.js";
+import {
+  areHostsEnabled,
+  hashPassword,
+  hostFromToken,
+  issueHostToken,
+  validateHost,
+  verifyPassword,
+} from "./hosts.js";
 import {
   demoReference,
   InsufficientDemoFunds,
@@ -50,6 +58,12 @@ import {
  *   PATCH /api/admin/users/:id           — change a user's live tier
  *   GET  /api/admin/withdrawals          — the payout queue
  *   PATCH /api/admin/withdrawals/:id     — decide a pending request
+ *   GET  /api/admin/sessions             — every promo broadcast, scored
+ *   PATCH /api/admin/sessions/:id        — force-end a live broadcast
+ *   PATCH /api/admin/hosts/:id           — suspend or reinstate a host
+ *   POST /api/sessions/register|login    — the promo host's own door
+ *   GET  /api/sessions/me                — host, live broadcast, history
+ *   POST /api/sessions/start|end         — open and close a broadcast
  *   GET  /health                         — Render's health check; also shows
  *                                          which secrets are still missing
  */
@@ -788,6 +802,494 @@ app.patch("/api/admin/withdrawals/:id", async (req, res) => {
   }
 
   return res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Promo sessions — the TikTok live desk
+// ---------------------------------------------------------------------------
+
+/**
+ * A staff member goes live, markets the app, and the people watching trade
+ * alongside them. A *session* is one of those broadcasts, opened by the host
+ * when the stream starts and closed when it ends, and every deposit raised in
+ * between is stamped with its id inside `deposit_start`.
+ *
+ * Two audiences share this data and neither may see the other's controls:
+ *
+ *   - the host, at `/sessions`, authenticated by their own token. Sees only
+ *     their own broadcasts, and may only end their own.
+ *   - the admin, at `/admin` → Sessions, behind the passcode. Sees everyone's,
+ *     may end anyone's, and holds the roster.
+ *
+ * The one-at-a-time rule is not enforced here. It lives in a partial unique
+ * index in `sessions.sql`, because two hosts pressing Start in the same second
+ * is precisely the case a check in application code loses.
+ */
+
+/** Minor units as a string, matching the money discipline everywhere else. */
+function toSessionRow(row) {
+  return {
+    id: row.id,
+    hostId: row.host_id,
+    hostName: row.host_name,
+    hostPhone: row.host_phone,
+    hostStatus: row.host_status === "SUSPENDED" ? "SUSPENDED" : "ACTIVE",
+    spendMinor: String(row.spend_minor ?? 0),
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    endedBy: row.ended_by ?? null,
+    stats: {
+      depositCount: Number(row.deposit_count ?? 0),
+      depositMinor: String(row.deposit_minor ?? 0),
+      pendingCount: Number(row.pending_count ?? 0),
+      pendingMinor: String(row.pending_minor ?? 0),
+      failedCount: Number(row.failed_count ?? 0),
+      depositors: Number(row.depositors ?? 0),
+      newDepositors: Number(row.new_depositors ?? 0),
+      signups: Number(row.signups ?? 0),
+    },
+  };
+}
+
+function toHostRow(row) {
+  return {
+    id: row.id,
+    fullName: row.full_name,
+    phone: row.phone,
+    status: row.status === "SUSPENDED" ? "SUSPENDED" : "ACTIVE",
+    createdAt: row.created_at,
+  };
+}
+
+/** Twelve hours, matching `promo_sessions_reap`'s own cut-off in SQL. */
+const SESSION_MAX_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * The broadcast currently holding the desk, or null.
+ *
+ * Closes a forgotten one on the way past — a host who shut their laptop
+ * without pressing End would otherwise block the whole team until somebody
+ * noticed. The reap runs only when there is something stale to reap, so the
+ * ordinary poll stays a pure read.
+ */
+async function liveSession(db) {
+  const read = () =>
+    db
+      .from("promo_sessions")
+      .select("id, host_id, started_at, spend_minor, promo_hosts(full_name)")
+      .is("ended_at", null)
+      .maybeSingle();
+
+  const { data, error } = await read();
+  if (error || !data) return null;
+
+  if (Date.parse(data.started_at) < Date.now() - SESSION_MAX_MS) {
+    await db.rpc("promo_sessions_reap");
+    const { data: after } = await read();
+    return after ?? null;
+  }
+
+  return data;
+}
+
+/**
+ * The host's own gate. Returns `{ db, host }`, or answers the request and
+ * returns null — the same shape as `adminGuard`, for the same reason: one
+ * function decides who may touch this data, so it cannot be forgotten on the
+ * next route added.
+ *
+ * A suspended host is refused here rather than at Start, so they are told the
+ * moment they open the page instead of at the worst possible time.
+ */
+async function hostGuard(req, res) {
+  if (!areHostsEnabled()) {
+    res.status(503).json({ error: "Sessions are not configured. Set AUTH_SECRET." });
+    return null;
+  }
+
+  const db = supabaseAdmin();
+  if (!db) {
+    res
+      .status(503)
+      .json({ error: "Supabase is not configured. Set SUPABASE_SERVICE_ROLE_KEY." });
+    return null;
+  }
+
+  const hostId = hostFromToken(bearerToken(req));
+  if (!hostId) {
+    res.status(401).json({ error: "Not signed in" });
+    return null;
+  }
+
+  const { data, error } = await db
+    .from("promo_hosts")
+    .select("id, full_name, phone, status, created_at")
+    .eq("id", hostId)
+    .maybeSingle();
+
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return null;
+  }
+  if (!data) {
+    res.status(401).json({ error: "Not signed in" });
+    return null;
+  }
+
+  return { db, host: toHostRow(data) };
+}
+
+/**
+ * Sign-in throttle, per number. The admin console's passcode is one secret
+ * shared by one person; a host roster is many weak passwords, so this one
+ * matters more.
+ */
+const HOST_WINDOW_MS = 15 * 60 * 1000;
+const HOST_MAX_ATTEMPTS = 12;
+const hostAttempts = new Map();
+
+function hostThrottled(key) {
+  const now = Date.now();
+  const entry = hostAttempts.get(key);
+
+  if (!entry || entry.resetAt <= now) {
+    hostAttempts.set(key, { count: 1, resetAt: now + HOST_WINDOW_MS });
+    return false;
+  }
+
+  entry.count += 1;
+  return entry.count > HOST_MAX_ATTEMPTS;
+}
+
+// --- POST /api/sessions/register — a host enrols themselves -----------------
+
+/**
+ * Open registration, with a suspend switch in the console rather than an
+ * approval step in front. The desk is a staff tool on a URL nobody advertises,
+ * and making the admin approve every host would mean an employee arriving for
+ * a scheduled live and waiting on someone to notice. The control that matters
+ * — nobody unwanted holds the desk — is the admin's Suspend, plus the fact
+ * that only one broadcast runs at a time and the admin can end it.
+ */
+app.post("/api/sessions/register", async (req, res) => {
+  if (!areHostsEnabled()) {
+    return res
+      .status(503)
+      .json({ error: "Sessions are not configured. Set AUTH_SECRET." });
+  }
+
+  const db = supabaseAdmin();
+  if (!db) {
+    return res
+      .status(503)
+      .json({ error: "Supabase is not configured. Set SUPABASE_SERVICE_ROLE_KEY." });
+  }
+
+  const body = parseBody(req) ?? {};
+  const check = validateHost(body.fullName, body.phone, body.password);
+  if (!check.ok) {
+    return res.status(400).json({ error: check.reason });
+  }
+
+  const { fullName, phone, password } = check.value;
+
+  const { data, error } = await db
+    .from("promo_hosts")
+    .insert({
+      full_name: fullName,
+      phone,
+      password_hash: hashPassword(password),
+    })
+    .select("id, full_name, phone, status, created_at")
+    .maybeSingle();
+
+  if (error) {
+    // 23505 is unique_violation — the number is already on the roster.
+    if (error.code === "23505") {
+      return res
+        .status(409)
+        .json({ error: "That number is already registered. Sign in instead." });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+
+  return res.json({ token: issueHostToken(data.id), host: toHostRow(data) });
+});
+
+// --- POST /api/sessions/login -----------------------------------------------
+
+app.post("/api/sessions/login", async (req, res) => {
+  if (!areHostsEnabled()) {
+    return res
+      .status(503)
+      .json({ error: "Sessions are not configured. Set AUTH_SECRET." });
+  }
+
+  const db = supabaseAdmin();
+  if (!db) {
+    return res
+      .status(503)
+      .json({ error: "Supabase is not configured. Set SUPABASE_SERVICE_ROLE_KEY." });
+  }
+
+  const body = parseBody(req) ?? {};
+  const phone = normalisePhone(String(body.phone ?? ""));
+  const password = String(body.password ?? "");
+
+  if (!phone || !password) {
+    return res.status(400).json({ error: "Enter your number and password" });
+  }
+
+  if (hostThrottled(phone)) {
+    return res.status(429).json({ error: "Too many attempts. Try again later." });
+  }
+
+  const { data, error } = await db
+    .from("promo_hosts")
+    .select("id, full_name, phone, status, created_at, password_hash")
+    .eq("phone", phone)
+    .maybeSingle();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  // One message for "no such host" and for "wrong password": telling them
+  // apart turns this into a roster-enumeration endpoint.
+  if (!data || !verifyPassword(password, data.password_hash)) {
+    return res.status(401).json({ error: "Wrong number or password" });
+  }
+
+  return res.json({ token: issueHostToken(data.id), host: toHostRow(data) });
+});
+
+// --- GET /api/sessions/me — everything the host portal renders ---------------
+
+/**
+ * The host, their own broadcasts newest first, and — when somebody *else*
+ * holds the desk — who and since when. That last field is why the Start button
+ * can say what is in the way instead of only refusing.
+ */
+app.get("/api/sessions/me", async (req, res) => {
+  const gate = await hostGuard(req, res);
+  if (!gate) return;
+  const { db, host } = gate;
+
+  const live = await liveSession(db);
+
+  const { data, error } = await db.rpc("promo_sessions_report", {
+    p_host: host.id,
+    p_limit: 25,
+  });
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  const sessions = (data ?? []).map(toSessionRow);
+
+  return res.json({
+    host,
+    // The host's own open broadcast, with its scoreboard already attached.
+    live: sessions.find((row) => row.endedAt === null) ?? null,
+    blockedBy:
+      live && live.host_id !== host.id
+        ? {
+            hostName: live.promo_hosts?.full_name ?? "Another host",
+            startedAt: live.started_at,
+          }
+        : null,
+    history: sessions.filter((row) => row.endedAt !== null),
+  });
+});
+
+// --- POST /api/sessions/start — go live -------------------------------------
+
+/**
+ * The promo spend is required before the timer starts, and that ordering is
+ * the point: it is the denominator of every figure the broadcast will be
+ * judged by, and a cost entered afterwards is a cost entered knowing the
+ * answer. Zero is allowed — an unpromoted live is a real thing — but it has to
+ * be typed.
+ */
+app.post("/api/sessions/start", async (req, res) => {
+  const gate = await hostGuard(req, res);
+  if (!gate) return;
+  const { db, host } = gate;
+
+  if (host.status !== "ACTIVE") {
+    return res
+      .status(403)
+      .json({ error: "This account is suspended. Speak to your admin." });
+  }
+
+  const body = parseBody(req) ?? {};
+  const spend = Math.round(Number(body.spendMinor));
+
+  if (!Number.isFinite(spend) || spend < 0 || spend > 100_000_000) {
+    return res.status(400).json({ error: "Enter what you spent promoting this live" });
+  }
+
+  const { data, error } = await db.rpc("promo_session_start", {
+    p_host: host.id,
+    p_spend: spend,
+  });
+
+  if (error) {
+    if (error.message.includes("SESSION_RUNNING")) {
+      return res
+        .status(409)
+        .json({ error: "Somebody is already live. Only one session runs at a time." });
+    }
+    if (error.message.includes("HOST_SUSPENDED")) {
+      return res
+        .status(403)
+        .json({ error: "This account is suspended. Speak to your admin." });
+    }
+    if (error.message.includes("BAD_SPEND")) {
+      return res.status(400).json({ error: "Enter a valid promotion cost" });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+
+  return res.json({ id: data });
+});
+
+// --- POST /api/sessions/end — the host closes their own broadcast ------------
+
+app.post("/api/sessions/end", async (req, res) => {
+  const gate = await hostGuard(req, res);
+  if (!gate) return;
+  const { db, host } = gate;
+
+  const body = parseBody(req) ?? {};
+  const sessionId = typeof body.id === "string" ? body.id : null;
+  if (!sessionId) {
+    return res.status(400).json({ error: "Which session?" });
+  }
+
+  // `p_host` scopes the update to this host's own row, so a host holding a
+  // valid token still cannot end somebody else's broadcast.
+  const { data, error } = await db.rpc("promo_session_end", {
+    p_session: sessionId,
+    p_by: "HOST",
+    p_host: host.id,
+  });
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+  if (data !== true) {
+    return res
+      .status(409)
+      .json({ error: "That session is already closed." });
+  }
+
+  return res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Promo sessions, from the admin's side
+// ---------------------------------------------------------------------------
+
+// --- GET /api/admin/sessions — every broadcast, plus the roster --------------
+
+app.get("/api/admin/sessions", async (req, res) => {
+  const db = adminGuard(req, res);
+  if (!db) return;
+
+  await liveSession(db); // reaps a forgotten broadcast before it is reported
+
+  const [report, roster] = await Promise.all([
+    db.rpc("promo_sessions_report", { p_host: null, p_limit: 200 }),
+    db
+      .from("promo_hosts")
+      .select("id, full_name, phone, status, created_at")
+      .order("created_at", { ascending: false })
+      .limit(200),
+  ]);
+
+  if (report.error) {
+    return res.status(500).json({ error: report.error.message });
+  }
+  if (roster.error) {
+    return res.status(500).json({ error: roster.error.message });
+  }
+
+  return res.json({
+    sessions: (report.data ?? []).map(toSessionRow),
+    hosts: (roster.data ?? []).map(toHostRow),
+  });
+});
+
+// --- PATCH /api/admin/sessions/:id — force-end -------------------------------
+
+/**
+ * The admin's override, for the host who went offline mid-live or forgot. It
+ * is the same SQL the host's own End calls, with `p_host` left null so it
+ * reaches any broadcast — and it stamps `ADMIN`, so the record says who closed
+ * it. A session that was already closed answers 409 rather than pretending.
+ */
+app.patch("/api/admin/sessions/:id", async (req, res) => {
+  const db = adminGuard(req, res);
+  if (!db) return;
+
+  const body = parseBody(req) ?? {};
+  if (body.action !== "END") {
+    return res.status(400).json({ error: "action must be END" });
+  }
+
+  const { data, error } = await db.rpc("promo_session_end", {
+    p_session: req.params.id,
+    p_by: "ADMIN",
+    p_host: null,
+  });
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+  if (data !== true) {
+    return res.status(409).json({ error: "That session is already closed." });
+  }
+
+  return res.json({ ok: true });
+});
+
+// --- PATCH /api/admin/hosts/:id — suspend or reinstate ------------------------
+
+/**
+ * Suspension is the roster's only control, and it is deliberately not a
+ * delete: a host's past broadcasts are the record their pay and the platform's
+ * numbers rest on, and removing the person would take the record with them. A
+ * suspended host can still sign in and read their own history; they simply
+ * cannot open a broadcast.
+ */
+app.patch("/api/admin/hosts/:id", async (req, res) => {
+  const db = adminGuard(req, res);
+  if (!db) return;
+
+  const body = parseBody(req) ?? {};
+  const status = body.status;
+
+  if (status !== "ACTIVE" && status !== "SUSPENDED") {
+    return res.status(400).json({ error: "status must be ACTIVE or SUSPENDED" });
+  }
+
+  const { data, error } = await db
+    .from("promo_hosts")
+    .update({ status })
+    .eq("id", req.params.id)
+    .select("id, full_name, phone, status, created_at")
+    .maybeSingle();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+  if (!data) {
+    return res.status(404).json({ error: "No such host" });
+  }
+
+  return res.json({ host: toHostRow(data) });
 });
 
 // ---------------------------------------------------------------------------

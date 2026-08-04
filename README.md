@@ -14,8 +14,43 @@ Render's environment), but there is no reason to publish it.
 | `POST /api/payments/deposit` | The signed-in customer (Bearer token) | Books a PENDING cash event via `deposit_start`, raises the M-Pesa STK push |
 | `POST /api/payments/payhero/callback` | PayHero (HMAC-signed URL) | Settles the event via `deposit_settle`, which credits the balance |
 | `/api/admin/session`, `/api/admin/users`, `/api/admin/withdrawals` | The admin console (Bearer token from the passcode exchange) | User list, tier changes, the M-Pesa demo handset (PIN + opening balance), and the manual withdrawal queue |
+| `/api/admin/sessions`, `/api/admin/hosts/:id` | The admin console | Every promo broadcast with its figures; force-end one; suspend a host |
+| `/api/sessions/*` | Promo hosts at `/sessions` (their own Bearer token) | Register, sign in, open and close a broadcast — see below |
 | `/api/mpesa/*` | The M-Pesa clone app, and VIP customers' terminals | The VIP demo rail — see below |
 | `GET /health` | Render / you | Reports which of Supabase / PayHero is configured |
+
+## The live desk
+
+Staff go live on TikTok, market the app, and the people watching trade along. A
+*session* is one of those broadcasts. The host opens it at `/sessions` — entering
+what they paid to promote it — and closes it when the stream ends; every deposit
+raised in between is stamped with the session's id inside `deposit_start`, so
+what the live collected is a fact about the ledger rather than a time-range
+query run later.
+
+Run `supabase/sessions.sql` from the main repo, **last** of the migrations: it
+redefines `deposit_start` to add that stamp, and re-running `go-live.sql` after
+it would silently take the stamp away again.
+
+| Route | Who calls it | Auth |
+| --- | --- | --- |
+| `POST /api/sessions/register` | A host enrolling themselves | None (name, number, password) |
+| `POST /api/sessions/login` | A host signing in | Password, throttled per number |
+| `GET /api/sessions/me` | The desk, polling | Host token |
+| `POST /api/sessions/start` | The host going live | Host token |
+| `POST /api/sessions/end` | The host coming off air | Host token — scoped to their own session |
+
+Hosts are **not** Supabase Auth users. They are staff, they never hold a
+balance, and the customer identity is derived from the phone number
+(`254…@meridian.invalid`) — so the same person working the desk and holding a
+trading account would collide with themselves. They get their own table
+(`promo_hosts`), scrypt-hashed passwords, and a token that names its subject
+(`hosts.js`). It needs `AUTH_SECRET`; without one the desk answers 503.
+
+Only one broadcast runs at a time, enforced by a partial unique index rather
+than a check in this service — two hosts pressing Start in the same second is
+exactly the case application code loses. One forgotten for twelve hours is
+closed automatically, and an admin can force-end any of them.
 
 ## The VIP demo rail
 
