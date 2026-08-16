@@ -1,11 +1,17 @@
 import express from "express";
 import { supabaseAdmin, isDbConfigured } from "./supabase.js";
 import {
+  adminFromToken,
   bearerToken,
   isAdminEnabled,
-  issueToken,
+  isBootstrapPasscodeSet,
+  issueAdminToken,
+  issueBootstrapToken,
+  normaliseUsername,
+  validateAdmin,
+  validatePassword,
+  verifyBootstrapToken,
   verifyPasscode,
-  verifyToken,
 } from "./admin.js";
 import { identityEmail, normalisePhone, validateRegistration } from "./phone.js";
 import {
@@ -419,18 +425,36 @@ app.post("/api/payments/payhero/callback", async (req, res) => {
  * Having a single function that decides "may this request touch other
  * people's data" is what keeps the check from being forgotten on the third
  * route someone adds — a forgotten guard here is a full database leak.
+ *
+ * It is now async, because authority is read from the database rather than
+ * taken from the token. That costs one query per privileged request and buys
+ * the thing a token cannot give: revocation that takes effect immediately.
+ * Suspend an admin and their next request fails, rather than their next request
+ * in up to eight hours.
+ *
+ * The authenticated admin is attached to `req.admin` instead of being returned,
+ * so the seven existing call sites keep their shape — `const db = await
+ * adminGuard(...)` — and only the routes that actually care who is calling have
+ * to look.
  */
-function adminGuard(req, res) {
+async function adminGuard(req, res) {
   if (!isAdminEnabled()) {
     res
       .status(503)
-      .json({ error: "Admin console is disabled. Set ADMIN_PASSCODE." });
+      .json({ error: "Admin console is disabled. Set AUTH_SECRET." });
     return null;
   }
-  if (!verifyToken(bearerToken(req))) {
+
+  // Token before database, deliberately. Verifying it needs no I/O — it is
+  // pure HMAC — and checking it first means an unauthenticated caller learns
+  // only "not signed in", never which of the service's dependencies are
+  // configured. Reversing these two turns the guard into a config probe.
+  const claim = adminFromToken(bearerToken(req));
+  if (!claim) {
     res.status(401).json({ error: "Not signed in" });
     return null;
   }
+
   const db = supabaseAdmin();
   if (!db) {
     res
@@ -438,7 +462,82 @@ function adminGuard(req, res) {
       .json({ error: "Supabase is not configured. Set SUPABASE_SERVICE_ROLE_KEY." });
     return null;
   }
+
+  const { data, error } = await db
+    .from("admin_users")
+    .select("id, username, full_name, role, status, password_changed_at")
+    .eq("id", claim.id)
+    .maybeSingle();
+
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return null;
+  }
+
+  // Deleted, suspended, or holding a token minted before the password last
+  // changed. All three are "this session is over", and all three deliberately
+  // return the same 401: telling a caller *which* one is telling them whether
+  // the account exists.
+  if (
+    !data ||
+    data.status !== "ACTIVE" ||
+    new Date(data.password_changed_at).getTime() > claim.issuedAt
+  ) {
+    res.status(401).json({ error: "Not signed in" });
+    return null;
+  }
+
+  req.admin = data;
   return db;
+}
+
+/**
+ * The second gate, for the routes only a super admin may reach.
+ *
+ * Always called *after* `adminGuard` has populated `req.admin` — it deliberately
+ * does not re-authenticate, because a second implementation of "who is this" is
+ * a second chance to get it wrong.
+ */
+function requireSuper(req, res) {
+  if (req.admin?.role !== "SUPER_ADMIN") {
+    res.status(403).json({ error: "Only a super admin can do that" });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Whether the console has an active super admin yet.
+ *
+ * The answer decides whether the bootstrap door is open, so it is asked on
+ * every sign-in attempt rather than cached: a cached "no" that outlives the
+ * first super admin's creation is a passcode that still works after it should
+ * have stopped.
+ */
+async function hasSuperAdmin(db) {
+  const { data, error } = await db
+    .from("admin_users")
+    .select("id")
+    .eq("role", "SUPER_ADMIN")
+    .eq("status", "ACTIVE")
+    .limit(1);
+
+  if (error) throw new Error(error.message);
+  return (data ?? []).length > 0;
+}
+
+/** The console's shape for an admin row. Never carries the digest. */
+function toAdminRow(row) {
+  return {
+    id: row.id,
+    username: row.username,
+    fullName: row.full_name ?? row.fullName ?? "",
+    role: row.role,
+    status: row.status,
+    createdAt: row.created_at ?? null,
+    lastLoginAt: row.last_login_at ?? null,
+    createdByName: row.created_by_name ?? null,
+  };
 }
 
 /**
@@ -464,23 +563,69 @@ function adminThrottled(key) {
 }
 
 // The console probes this on load to decide what to render: the setup notice,
-// the passcode gate, or the console itself.
-app.get("/api/admin/session", (req, res) => {
+// the bootstrap form, the sign-in form, or the console itself.
+app.get("/api/admin/session", async (req, res) => {
+  const enabled = isAdminEnabled();
+  const db = supabaseAdmin();
+
+  let needsBootstrap = false;
+  if (db) {
+    try {
+      needsBootstrap = !(await hasSuperAdmin(db));
+    } catch {
+      // A database that cannot answer is reported as "not bootstrapped" only
+      // if it is also unconfigured; here it is reachable-but-erroring, and
+      // claiming the console needs setting up would invite someone to create a
+      // second super admin over a transient fault.
+      needsBootstrap = false;
+    }
+  }
+
+  const claim = adminFromToken(bearerToken(req));
+  let me = null;
+  if (claim && db) {
+    const { data } = await db
+      .from("admin_users")
+      .select("id, username, full_name, role, status, password_changed_at")
+      .eq("id", claim.id)
+      .maybeSingle();
+    if (
+      data &&
+      data.status === "ACTIVE" &&
+      new Date(data.password_changed_at).getTime() <= claim.issuedAt
+    ) {
+      me = toAdminRow(data);
+    }
+  }
+
   res.json({
-    enabled: isAdminEnabled(),
+    enabled,
     db: isDbConfigured(),
-    signedIn: verifyToken(bearerToken(req)),
+    signedIn: Boolean(me),
+    admin: me,
+    // Only advertise the bootstrap door when it can actually be opened.
+    needsBootstrap: needsBootstrap && isBootstrapPasscodeSet(),
+    // A console with no super admin and no passcode cannot be set up at all,
+    // and saying so is more use than a sign-in form nobody can satisfy.
+    bootstrapBlocked: needsBootstrap && !isBootstrapPasscodeSet(),
   });
 });
 
-// Passcode in, signed token out. The token is the console's to hold — there
-// is no cookie, because the console and this API live on different origins
-// and a strict cookie would never be sent (see admin.js).
-app.post("/api/admin/session", (req, res) => {
+// Username and password in, signed token out. The token is the console's to
+// hold — there is no cookie, because the console and this API live on
+// different origins and a strict cookie would never be sent (see admin.js).
+app.post("/api/admin/session", async (req, res) => {
   if (!isAdminEnabled()) {
     return res
       .status(503)
-      .json({ error: "Admin console is disabled. Set ADMIN_PASSCODE." });
+      .json({ error: "Admin console is disabled. Set AUTH_SECRET." });
+  }
+
+  const db = supabaseAdmin();
+  if (!db) {
+    return res
+      .status(503)
+      .json({ error: "Supabase is not configured. Set SUPABASE_SERVICE_ROLE_KEY." });
   }
 
   const client =
@@ -494,19 +639,379 @@ app.post("/api/admin/session", (req, res) => {
   }
 
   const body = parseBody(req) ?? {};
-  const passcode = typeof body.passcode === "string" ? body.passcode : "";
+  const username = normaliseUsername(body.username);
+  const password = String(body.password ?? "");
 
-  if (!verifyPasscode(passcode)) {
-    return res.status(401).json({ error: "Incorrect passcode" });
+  if (!username || !password) {
+    return res.status(400).json({ error: "Enter your username and password" });
   }
 
-  return res.json({ ok: true, token: issueToken() });
+  const { data, error } = await db
+    .from("admin_users")
+    .select("id, username, full_name, role, status, password_hash")
+    .eq("username", username)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // One message for "no such admin", "wrong password" and "suspended". Which
+  // of the three it was is exactly what an attacker is trying to learn, and a
+  // suspended admin learning they are suspended from the login form is not
+  // worth telling them.
+  const denied = () => res.status(401).json({ error: "Incorrect username or password" });
+
+  if (!data || data.status !== "ACTIVE") {
+    // Still spend the time hashing when there is no row, so the absence of an
+    // account is not detectable from how fast the rejection comes back.
+    if (!data) verifyPassword(password, "scrypt$00$00");
+    return denied();
+  }
+
+  if (!verifyPassword(password, data.password_hash)) return denied();
+
+  // Best-effort: a failed stamp must not fail the sign-in.
+  await db
+    .from("admin_users")
+    .update({ last_login_at: new Date().toISOString() })
+    .eq("id", data.id);
+
+  return res.json({
+    ok: true,
+    token: issueAdminToken(data.id),
+    admin: toAdminRow(data),
+  });
+});
+
+// --- POST /api/admin/bootstrap — the passcode's one remaining job -----------
+
+/*
+ * Exchanges ADMIN_PASSCODE for a short-lived token that can do exactly one
+ * thing: create the first super admin. Both halves are checked against the
+ * live state of the table rather than a flag, so the door closes the instant
+ * the account exists — including for a bootstrap token minted seconds earlier
+ * and still inside its fifteen minutes.
+ */
+app.post("/api/admin/bootstrap", async (req, res) => {
+  const db = supabaseAdmin();
+  if (!db) {
+    return res
+      .status(503)
+      .json({ error: "Supabase is not configured. Set SUPABASE_SERVICE_ROLE_KEY." });
+  }
+  if (!isBootstrapPasscodeSet()) {
+    return res
+      .status(503)
+      .json({ error: "No bootstrap passcode is set. See supabase/admins.sql." });
+  }
+
+  const client =
+    (req.headers["x-forwarded-for"] ?? "").split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    "local";
+  if (adminThrottled(client)) {
+    return res.status(429).json({ error: "Too many attempts. Try again later." });
+  }
+
+  let occupied;
+  try {
+    occupied = await hasSuperAdmin(db);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+  if (occupied) {
+    return res
+      .status(409)
+      .json({ error: "This console already has a super admin. Sign in instead." });
+  }
+
+  const body = parseBody(req) ?? {};
+
+  // Step one: passcode in, bootstrap token out.
+  if (!body.token) {
+    if (!verifyPasscode(String(body.passcode ?? ""))) {
+      return res.status(401).json({ error: "Incorrect passcode" });
+    }
+    return res.json({ ok: true, token: issueBootstrapToken() });
+  }
+
+  // Step two: bootstrap token plus the account details.
+  if (!verifyBootstrapToken(String(body.token))) {
+    return res.status(401).json({ error: "That setup session has expired. Start again." });
+  }
+
+  const check = validateAdmin(body.username, body.fullName, body.password);
+  if (!check.ok) return res.status(400).json({ error: check.reason });
+
+  const { username, fullName, password } = check.value;
+
+  const { data, error } = await db
+    .from("admin_users")
+    .insert({
+      username,
+      full_name: fullName,
+      password_hash: hashPassword(password),
+      role: "SUPER_ADMIN",
+    })
+    .select("id, username, full_name, role, status, created_at, last_login_at")
+    .maybeSingle();
+
+  if (error) {
+    if (error.code === "23505") {
+      return res.status(409).json({ error: "That username is taken" });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+
+  return res.json({
+    ok: true,
+    token: issueAdminToken(data.id),
+    admin: toAdminRow(data),
+  });
 });
 
 // Sessions are stateless — sign-out is the client forgetting the token. The
 // endpoint exists so the console's sign-out has something honest to call.
 app.delete("/api/admin/session", (_req, res) => {
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Admin accounts
+// ---------------------------------------------------------------------------
+
+// --- POST /api/admin/password — change your own -----------------------------
+
+/*
+ * Any admin may change their own password; nobody may change anybody else's.
+ *
+ * The current password is required even though the caller is already
+ * authenticated, because the two questions are different: the token proves this
+ * browser was signed in at some point in the last eight hours, and the password
+ * proves the person at the keyboard right now is the account holder. A borrowed
+ * unlocked laptop satisfies the first and not the second.
+ *
+ * On success every other session for this admin dies, including the caller's —
+ * so a fresh token is issued and returned. Doing it any other way would mean a
+ * password change either logged you out of the browser you did it in, or left
+ * the sessions it was meant to revoke alive.
+ */
+app.post("/api/admin/password", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+
+  const body = parseBody(req) ?? {};
+  const current = String(body.currentPassword ?? "");
+  const next = String(body.newPassword ?? "");
+
+  const check = validatePassword(next);
+  if (!check.ok) return res.status(400).json({ error: check.reason });
+
+  if (current === next) {
+    return res.status(400).json({ error: "That is already your password" });
+  }
+
+  const { data, error } = await db
+    .from("admin_users")
+    .select("password_hash")
+    .eq("id", req.admin.id)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data || !verifyPassword(current, data.password_hash)) {
+    return res.status(401).json({ error: "Current password is incorrect" });
+  }
+
+  const changedAt = new Date();
+  const { error: writeError } = await db
+    .from("admin_users")
+    .update({
+      password_hash: hashPassword(next),
+      password_changed_at: changedAt.toISOString(),
+    })
+    .eq("id", req.admin.id);
+
+  if (writeError) return res.status(500).json({ error: writeError.message });
+
+  // Minted a millisecond after the change, so it survives the very check that
+  // kills every token issued before it.
+  return res.json({
+    ok: true,
+    token: issueAdminToken(req.admin.id, changedAt.getTime() + 1),
+  });
+});
+
+// --- GET /api/admin/admins — the roster -------------------------------------
+
+/*
+ * Readable by any admin, not just a super admin. Who else holds the keys is
+ * not a secret from the people who hold them, and hiding the roster from
+ * ordinary admins would mean an intruder's account is visible only to the one
+ * person who might not be looking.
+ */
+app.get("/api/admin/admins", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+
+  const { data, error } = await db.rpc("admin_roster");
+  if (error) return res.status(500).json({ error: error.message });
+
+  return res.json({ admins: (data ?? []).map(toAdminRow) });
+});
+
+// --- POST /api/admin/admins — create one ------------------------------------
+
+app.post("/api/admin/admins", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireSuper(req, res)) return;
+
+  const body = parseBody(req) ?? {};
+  const check = validateAdmin(body.username, body.fullName, body.password);
+  if (!check.ok) return res.status(400).json({ error: check.reason });
+
+  const role = body.role === "SUPER_ADMIN" ? "SUPER_ADMIN" : "ADMIN";
+  const { username, fullName, password } = check.value;
+
+  const { data, error } = await db
+    .from("admin_users")
+    .insert({
+      username,
+      full_name: fullName,
+      password_hash: hashPassword(password),
+      role,
+      created_by: req.admin.id,
+    })
+    .select("id, username, full_name, role, status, created_at, last_login_at")
+    .maybeSingle();
+
+  if (error) {
+    if (error.code === "23505") {
+      return res.status(409).json({ error: "That username is taken" });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+
+  return res.json({ ok: true, admin: toAdminRow(data) });
+});
+
+// --- PATCH /api/admin/admins/:id — role, status, or a password reset --------
+
+/*
+ * A super admin's three levers over somebody else's account.
+ *
+ * `password` here is a *reset*, not a change: no current password is asked for,
+ * because the whole point is that the holder has lost it. It is therefore the
+ * one operation in this file that hands one person control of another's
+ * account, which is why it is super-admin-only and why it bumps
+ * `password_changed_at` — a reset that left the old sessions alive would be a
+ * lockout that locks nobody out.
+ *
+ * Self-demotion and self-suspension are refused here rather than left to the
+ * database trigger. The trigger only knows the table would be left without a
+ * super admin; it cannot know that the specific mistake being made is the one
+ * where somebody removes their own last privilege by accident.
+ */
+app.patch("/api/admin/admins/:id", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireSuper(req, res)) return;
+
+  const id = String(req.params.id ?? "");
+  const body = parseBody(req) ?? {};
+  const patch = {};
+
+  if (body.role !== undefined) {
+    if (body.role !== "ADMIN" && body.role !== "SUPER_ADMIN") {
+      return res.status(400).json({ error: "Unknown role" });
+    }
+    if (id === req.admin.id && body.role !== "SUPER_ADMIN") {
+      return res
+        .status(400)
+        .json({ error: "Promote another super admin before demoting yourself" });
+    }
+    patch.role = body.role;
+  }
+
+  if (body.status !== undefined) {
+    if (body.status !== "ACTIVE" && body.status !== "SUSPENDED") {
+      return res.status(400).json({ error: "Unknown status" });
+    }
+    if (id === req.admin.id && body.status !== "ACTIVE") {
+      return res.status(400).json({ error: "You cannot suspend yourself" });
+    }
+    patch.status = body.status;
+  }
+
+  if (body.fullName !== undefined) {
+    const fullName = String(body.fullName).trim().replace(/\s+/g, " ");
+    if (fullName.length < 3 || fullName.length > 60) {
+      return res.status(400).json({ error: "Enter the admin's full name" });
+    }
+    patch.full_name = fullName;
+  }
+
+  if (body.password !== undefined) {
+    const check = validatePassword(body.password);
+    if (!check.ok) return res.status(400).json({ error: check.reason });
+    patch.password_hash = hashPassword(String(body.password));
+    patch.password_changed_at = new Date().toISOString();
+  }
+
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: "Nothing to change" });
+  }
+
+  const { data, error } = await db
+    .from("admin_users")
+    .update(patch)
+    .eq("id", id)
+    .select("id, username, full_name, role, status, created_at, last_login_at")
+    .maybeSingle();
+
+  if (error) {
+    // The deferred trigger from admins.sql surfaces here as a plain message —
+    // the only way this fires is a race that beat the checks above.
+    if (String(error.message).includes("LAST_SUPER_ADMIN")) {
+      return res
+        .status(409)
+        .json({ error: "That would leave the console with no super admin" });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+  if (!data) return res.status(404).json({ error: "No such admin" });
+
+  return res.json({ ok: true, admin: toAdminRow(data) });
+});
+
+// --- DELETE /api/admin/admins/:id -------------------------------------------
+
+/*
+ * Deleting yourself is refused for the same reason suspending yourself is: it
+ * is never the intended action, and it is unrecoverable without the SQL editor.
+ * Suspension is the reversible option and the console offers it first.
+ */
+app.delete("/api/admin/admins/:id", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireSuper(req, res)) return;
+
+  const id = String(req.params.id ?? "");
+  if (id === req.admin.id) {
+    return res.status(400).json({ error: "You cannot delete your own account" });
+  }
+
+  const { error } = await db.from("admin_users").delete().eq("id", id);
+
+  if (error) {
+    if (String(error.message).includes("LAST_SUPER_ADMIN")) {
+      return res
+        .status(409)
+        .json({ error: "That would leave the console with no super admin" });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+
+  return res.json({ ok: true });
 });
 
 // --- GET /api/admin/users?q=… — every profile, newest first ----------------
@@ -560,7 +1065,7 @@ async function walletsFor(db, userIds) {
 }
 
 app.get("/api/admin/users", async (req, res) => {
-  const db = adminGuard(req, res);
+  const db = await adminGuard(req, res);
   if (!db) return;
 
   const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
@@ -610,7 +1115,7 @@ app.get("/api/admin/users", async (req, res) => {
  * balance: `profiles.live_balance` is not reachable from here at all.
  */
 app.patch("/api/admin/users/:id", async (req, res) => {
-  const db = adminGuard(req, res);
+  const db = await adminGuard(req, res);
   if (!db) return;
 
   const body = parseBody(req) ?? {};
@@ -704,7 +1209,7 @@ app.patch("/api/admin/users/:id", async (req, res) => {
  * without a second round-trip per row.
  */
 app.get("/api/admin/withdrawals", async (req, res) => {
-  const db = adminGuard(req, res);
+  const db = await adminGuard(req, res);
   if (!db) return;
 
   const { data, error } = await db
@@ -762,7 +1267,7 @@ app.get("/api/admin/withdrawals", async (req, res) => {
  * second one's click changes nothing, and is told so.
  */
 app.patch("/api/admin/withdrawals/:id", async (req, res) => {
-  const db = adminGuard(req, res);
+  const db = await adminGuard(req, res);
   if (!db) return;
 
   const body = parseBody(req) ?? {};
@@ -1195,7 +1700,7 @@ app.post("/api/sessions/end", async (req, res) => {
 // --- GET /api/admin/sessions — every broadcast, plus the roster --------------
 
 app.get("/api/admin/sessions", async (req, res) => {
-  const db = adminGuard(req, res);
+  const db = await adminGuard(req, res);
   if (!db) return;
 
   await liveSession(db); // reaps a forgotten broadcast before it is reported
@@ -1231,7 +1736,7 @@ app.get("/api/admin/sessions", async (req, res) => {
  * it. A session that was already closed answers 409 rather than pretending.
  */
 app.patch("/api/admin/sessions/:id", async (req, res) => {
-  const db = adminGuard(req, res);
+  const db = await adminGuard(req, res);
   if (!db) return;
 
   const body = parseBody(req) ?? {};
@@ -1265,7 +1770,7 @@ app.patch("/api/admin/sessions/:id", async (req, res) => {
  * cannot open a broadcast.
  */
 app.patch("/api/admin/hosts/:id", async (req, res) => {
-  const db = adminGuard(req, res);
+  const db = await adminGuard(req, res);
   if (!db) return;
 
   const body = parseBody(req) ?? {};
