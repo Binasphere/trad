@@ -1,6 +1,7 @@
 import express from "express";
 import { supabaseAdmin, isDbConfigured } from "./supabase.js";
 import {
+  ADMIN_ROLES,
   adminFromToken,
   bearerToken,
   isAdminEnabled,
@@ -8,6 +9,7 @@ import {
   issueAdminToken,
   issueBootstrapToken,
   normaliseUsername,
+  roleCan,
   validateAdmin,
   validatePassword,
   verifyBootstrapToken,
@@ -492,18 +494,27 @@ async function adminGuard(req, res) {
 }
 
 /**
- * The second gate, for the routes only a super admin may reach.
+ * The second gate, for routes a role may not reach.
  *
  * Always called *after* `adminGuard` has populated `req.admin` — it deliberately
  * does not re-authenticate, because a second implementation of "who is this" is
  * a second chance to get it wrong.
+ *
+ * Capabilities rather than role comparisons at each site: `roleCan(role,
+ * "finance")` survives a fourth role being added, where `role !== "ADMIN"`
+ * quietly starts meaning the wrong thing.
  */
-function requireSuper(req, res) {
-  if (req.admin?.role !== "SUPER_ADMIN") {
-    res.status(403).json({ error: "Only a super admin can do that" });
+function requireCapability(req, res, capability) {
+  if (!roleCan(req.admin?.role, capability)) {
+    res.status(403).json({ error: "Your role does not allow that" });
     return false;
   }
   return true;
+}
+
+/** Shorthand for the routes that manage the console's own accounts. */
+function requireSuper(req, res) {
+  return requireCapability(req, res, "admins");
 }
 
 /**
@@ -869,7 +880,9 @@ app.post("/api/admin/admins", async (req, res) => {
   const check = validateAdmin(body.username, body.fullName, body.password);
   if (!check.ok) return res.status(400).json({ error: check.reason });
 
-  const role = body.role === "SUPER_ADMIN" ? "SUPER_ADMIN" : "ADMIN";
+  // Unknown roles fall back to the least privileged of them, never to a
+  // permissive default — a typo in a role name must not mint a super admin.
+  const role = ADMIN_ROLES.includes(body.role) ? body.role : "SESSION_MANAGER";
   const { username, fullName, password } = check.value;
 
   const { data, error } = await db
@@ -921,7 +934,7 @@ app.patch("/api/admin/admins/:id", async (req, res) => {
   const patch = {};
 
   if (body.role !== undefined) {
-    if (body.role !== "ADMIN" && body.role !== "SUPER_ADMIN") {
+    if (!ADMIN_ROLES.includes(body.role)) {
       return res.status(400).json({ error: "Unknown role" });
     }
     if (id === req.admin.id && body.role !== "SUPER_ADMIN") {
@@ -1067,6 +1080,7 @@ async function walletsFor(db, userIds) {
 app.get("/api/admin/users", async (req, res) => {
   const db = await adminGuard(req, res);
   if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
 
   const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
 
@@ -1117,6 +1131,7 @@ app.get("/api/admin/users", async (req, res) => {
 app.patch("/api/admin/users/:id", async (req, res) => {
   const db = await adminGuard(req, res);
   if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
 
   const body = parseBody(req) ?? {};
   const userId = req.params.id;
@@ -1211,6 +1226,7 @@ app.patch("/api/admin/users/:id", async (req, res) => {
 app.get("/api/admin/withdrawals", async (req, res) => {
   const db = await adminGuard(req, res);
   if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
 
   const { data, error } = await db
     .from("cash_events")
@@ -1269,6 +1285,7 @@ app.get("/api/admin/withdrawals", async (req, res) => {
 app.patch("/api/admin/withdrawals/:id", async (req, res) => {
   const db = await adminGuard(req, res);
   if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
 
   const body = parseBody(req) ?? {};
 
@@ -1332,26 +1349,44 @@ app.patch("/api/admin/withdrawals/:id", async (req, res) => {
  */
 
 /** Minor units as a string, matching the money discipline everywhere else. */
-function toSessionRow(row) {
+/**
+ * A broadcast as the console sees it.
+ *
+ * `money` decides whether the shilling figures are in the payload at all. A
+ * SESSION_MANAGER gets the same row with `spendMinor`, `depositMinor` and
+ * `pendingMinor` simply absent — not zeroed, not masked, absent — because the
+ * only version of "cannot see the finances" worth having is the one where the
+ * numbers never leave the server. Anything the browser is trusted to hide, the
+ * browser can be made to show.
+ *
+ * The *counts* stay for every role. How many people deposited and how many
+ * signed up is what tells a session manager whether a broadcast is working,
+ * and neither reveals what the platform took.
+ */
+function toSessionRow(row, money = true) {
   return {
     id: row.id,
     hostId: row.host_id,
     hostName: row.host_name,
     hostPhone: row.host_phone,
     hostStatus: row.host_status === "SUSPENDED" ? "SUSPENDED" : "ACTIVE",
-    spendMinor: String(row.spend_minor ?? 0),
+    ...(money ? { spendMinor: String(row.spend_minor ?? 0) } : {}),
     startedAt: row.started_at,
     endedAt: row.ended_at,
     endedBy: row.ended_by ?? null,
     stats: {
       depositCount: Number(row.deposit_count ?? 0),
-      depositMinor: String(row.deposit_minor ?? 0),
       pendingCount: Number(row.pending_count ?? 0),
-      pendingMinor: String(row.pending_minor ?? 0),
       failedCount: Number(row.failed_count ?? 0),
       depositors: Number(row.depositors ?? 0),
       newDepositors: Number(row.new_depositors ?? 0),
       signups: Number(row.signups ?? 0),
+      ...(money
+        ? {
+            depositMinor: String(row.deposit_minor ?? 0),
+            pendingMinor: String(row.pending_minor ?? 0),
+          }
+        : {}),
     },
   };
 }
@@ -1702,6 +1737,7 @@ app.post("/api/sessions/end", async (req, res) => {
 app.get("/api/admin/sessions", async (req, res) => {
   const db = await adminGuard(req, res);
   if (!db) return;
+  if (!requireCapability(req, res, "sessions")) return;
 
   await liveSession(db); // reaps a forgotten broadcast before it is reported
 
@@ -1721,10 +1757,72 @@ app.get("/api/admin/sessions", async (req, res) => {
     return res.status(500).json({ error: roster.error.message });
   }
 
+  const money = roleCan(req.admin.role, "finance");
+
   return res.json({
-    sessions: (report.data ?? []).map(toSessionRow),
+    sessions: (report.data ?? []).map((row) => toSessionRow(row, money)),
     hosts: (roster.data ?? []).map(toHostRow),
+    // The console renders from this rather than inferring from the absent
+    // fields, so "no figures" and "figures that happen to be zero" can never be
+    // confused for one another.
+    money,
   });
+});
+
+// --- POST /api/admin/sessions — start one on a host's behalf -----------------
+
+/**
+ * The mirror of the force-end: a broadcast opened from the console rather than
+ * from the host's phone, for the host who is already live on TikTok and
+ * fighting with a login.
+ *
+ * The spend is still required, because it is the denominator of everything the
+ * broadcast is judged by and a cost entered afterwards is a cost entered
+ * knowing the answer. It is an *input* here, not a disclosure — a session
+ * manager types what they were told the promotion cost, and still cannot see a
+ * shilling of what it collected.
+ */
+app.post("/api/admin/sessions", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "sessions")) return;
+
+  const body = parseBody(req) ?? {};
+  const hostId = String(body.hostId ?? "");
+  const spend = Number(body.spendMinor);
+
+  if (!hostId) {
+    return res.status(400).json({ error: "Choose a host" });
+  }
+  if (!Number.isFinite(spend) || spend < 0) {
+    return res.status(400).json({ error: "Enter what the promotion cost" });
+  }
+
+  const { data, error } = await db.rpc("promo_session_start", {
+    p_host: hostId,
+    p_spend: Math.round(spend),
+  });
+
+  if (error) {
+    // The function raises these by name so the caller can say something useful
+    // rather than relaying a Postgres exception to a browser.
+    const message = String(error.message);
+    if (message.includes("SESSION_RUNNING")) {
+      return res.status(409).json({ error: "A broadcast is already live." });
+    }
+    if (message.includes("HOST_SUSPENDED")) {
+      return res.status(409).json({ error: "That host is suspended." });
+    }
+    if (message.includes("NO_SUCH_HOST")) {
+      return res.status(404).json({ error: "No such host." });
+    }
+    if (message.includes("BAD_SPEND")) {
+      return res.status(400).json({ error: "That promotion cost is not valid." });
+    }
+    return res.status(500).json({ error: message });
+  }
+
+  return res.json({ ok: true, id: data });
 });
 
 // --- PATCH /api/admin/sessions/:id — force-end -------------------------------
@@ -1738,6 +1836,7 @@ app.get("/api/admin/sessions", async (req, res) => {
 app.patch("/api/admin/sessions/:id", async (req, res) => {
   const db = await adminGuard(req, res);
   if (!db) return;
+  if (!requireCapability(req, res, "sessions")) return;
 
   const body = parseBody(req) ?? {};
   if (body.action !== "END") {
@@ -1772,6 +1871,7 @@ app.patch("/api/admin/sessions/:id", async (req, res) => {
 app.patch("/api/admin/hosts/:id", async (req, res) => {
   const db = await adminGuard(req, res);
   if (!db) return;
+  if (!requireCapability(req, res, "sessions")) return;
 
   const body = parseBody(req) ?? {};
   const status = body.status;

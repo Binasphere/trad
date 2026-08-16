@@ -192,6 +192,36 @@ export function bearerToken(req) {
 // ---------------------------------------------------------------------------
 
 /**
+ * What each role may do, as capabilities rather than a list of routes.
+ *
+ * Routes change; the question "may this person see money" does not. Naming the
+ * capability at each route means adding a fourth role is one line here instead
+ * of an audit of every handler — and it makes the grant legible: you can read
+ * this table and know exactly what a SESSION_MANAGER can reach.
+ *
+ *   admins   — create, suspend and delete console accounts
+ *   finance  — customers, balances, withdrawals, and every money figure
+ *   sessions — start and end broadcasts, and the host roster
+ *
+ * `finance` is the one that matters. A SESSION_MANAGER runs the promo desk and
+ * has no business knowing what the platform holds, what any customer is worth,
+ * or what a broadcast collected. Withholding it is the entire point of the
+ * role, so it is withheld at the routes and in the payload, never in the UI.
+ */
+export const CAPABILITIES = {
+  SUPER_ADMIN: ["admins", "finance", "sessions"],
+  ADMIN: ["finance", "sessions"],
+  SESSION_MANAGER: ["sessions"],
+};
+
+export const ADMIN_ROLES = Object.keys(CAPABILITIES);
+
+/** Whether a role carries a capability. An unknown role carries none. */
+export function roleCan(role, capability) {
+  return (CAPABILITIES[role] ?? []).includes(capability);
+}
+
+/**
  * Ten, where a promo host's is eight.
  *
  * Not arbitrary: a host password guards one person's broadcast statistics, and
