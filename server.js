@@ -1362,8 +1362,16 @@ app.patch("/api/admin/withdrawals/:id", async (req, res) => {
  * The *counts* stay for every role. How many people deposited and how many
  * signed up is what tells a session manager whether a broadcast is working,
  * and neither reveals what the platform took.
+ *
+ * The flag is an options object rather than a positional boolean, and that is
+ * not style. `array.map(toSessionRow)` passes the *index* as the second
+ * argument, so a positional `money = true` silently became `0` — falsy — for
+ * the first row of every list and left the rest intact. The host portal then
+ * fed `undefined` to `BigInt` and the page died. Destructuring a number yields
+ * an empty object, so this shape defaults correctly no matter what `map` hands
+ * it.
  */
-function toSessionRow(row, money = true) {
+function toSessionRow(row, { money = true } = {}) {
   return {
     id: row.id,
     hostId: row.host_id,
@@ -1760,7 +1768,7 @@ app.get("/api/admin/sessions", async (req, res) => {
   const money = roleCan(req.admin.role, "finance");
 
   return res.json({
-    sessions: (report.data ?? []).map((row) => toSessionRow(row, money)),
+    sessions: (report.data ?? []).map((row) => toSessionRow(row, { money })),
     hosts: (roster.data ?? []).map(toHostRow),
     // The console renders from this rather than inferring from the absent
     // fields, so "no figures" and "figures that happen to be zero" can never be
