@@ -1948,6 +1948,16 @@ app.get("/api/admin/sessions", async (req, res) => {
     sessions: (report.data ?? []).map((row) => toSessionRow(row, { money })),
     hosts: (roster.data ?? []).map(toHostRow),
     sites: await listSites(),
+    /*
+     * Whether this caller may manage the roster.
+     *
+     * The host list itself still goes to every role, and has to: starting a
+     * broadcast on somebody's behalf means picking them from a list, and the
+     * sessions table names its host on every row. What this flag gates is the
+     * roster *surface* — the page of names, numbers and suspend controls — and
+     * the route behind it, which now refuses anyone but a super admin.
+     */
+    canManageHosts: roleCan(req.admin.role, "admins"),
     // The console renders from this rather than inferring from the absent
     // fields, so "no figures" and "figures that happen to be zero" can never be
     // confused for one another.
@@ -2057,7 +2067,15 @@ app.patch("/api/admin/sessions/:id", async (req, res) => {
 app.patch("/api/admin/hosts/:id", async (req, res) => {
   const db = await adminGuard(req, res);
   if (!db) return;
-  if (!requireCapability(req, res, "sessions")) return;
+  /*
+   * `admins`, not `sessions`.
+   *
+   * Suspending a host is staff management, not desk operation: it decides who
+   * may work, which is the same class of decision as suspending an admin and
+   * belongs to the same people. An ordinary admin runs the broadcasts; a super
+   * admin decides who is on the roster at all.
+   */
+  if (!requireCapability(req, res, "admins")) return;
 
   const body = parseBody(req) ?? {};
   const status = body.status;
