@@ -1488,14 +1488,18 @@ app.patch("/api/admin/withdrawals/:id", async (req, res) => {
  * an empty object, so this shape defaults correctly no matter what `map` hands
  * it.
  */
-function toSessionRow(row, { money = true } = {}) {
+function toSessionRow(row, { money = true, spend = money } = {}) {
   return {
     id: row.id,
     hostId: row.host_id,
     hostName: row.host_name,
     hostPhone: row.host_phone,
     hostStatus: row.host_status === "SUSPENDED" ? "SUSPENDED" : "ACTIVE",
-    ...(money ? { spendMinor: String(row.spend_minor ?? 0) } : {}),
+    // `spend` defaults to `money` but is separable, because the host desk needs
+    // exactly that split: a host may see the promotion cost — they typed it
+    // themselves before going live, and it is the one figure that is theirs —
+    // but never the takings it was spent against.
+    ...(spend ? { spendMinor: String(row.spend_minor ?? 0) } : {}),
     startedAt: row.started_at,
     endedAt: row.ended_at,
     endedBy: row.ended_by ?? null,
@@ -1792,7 +1796,9 @@ app.get("/api/sessions/me", async (req, res) => {
    * show. Counts stay — how many people paid, how many signed up — which is
    * what tells a host whether the live worked.
    */
-  const sessions = (data ?? []).map((row) => toSessionRow(row, { money: false }));
+  const sessions = (data ?? []).map((row) =>
+    toSessionRow(row, { money: false, spend: true }),
+  );
 
   return res.json({
     host,
