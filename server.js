@@ -1777,7 +1777,22 @@ app.get("/api/sessions/me", async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 
-  const sessions = (data ?? []).map(toSessionRow);
+  /*
+   * Hosts are not shown money — not their takings, not their promotion cost.
+   *
+   * A host is paid for running a broadcast, not for what it collected, and a
+   * live desk that displays a shilling total in front of somebody on camera is
+   * a live desk that eventually reads it out. It is also commercially theirs to
+   * know only in aggregate: the deposit ledger of a domain is not a promoter's
+   * information.
+   *
+   * Withheld at the source, exactly as it is for a SESSION_MANAGER admin. The
+   * fields are absent from the payload rather than hidden by the page, because
+   * anything the browser is trusted to conceal, the browser can be made to
+   * show. Counts stay — how many people paid, how many signed up — which is
+   * what tells a host whether the live worked.
+   */
+  const sessions = (data ?? []).map((row) => toSessionRow(row, { money: false }));
 
   return res.json({
     host,
