@@ -16,6 +16,7 @@ import {
   verifyPasscode,
 } from "./admin.js";
 import { identityEmail, normalisePhone, validateRegistration } from "./phone.js";
+import { isSiteId, listSites, resolveSite } from "./sites.js";
 import {
   areHostsEnabled,
   hashPassword,
@@ -227,14 +228,20 @@ app.post("/api/auth/register", async (req, res) => {
 
   const { phone, username, password } = validated.value;
 
+  // Which product this sign-up belongs to, from the origin the browser sent.
+  // It decides both the derived identity and the profile's site, and the two
+  // must agree — an account addressed as one product and recorded as the other
+  // could sign in but would see the wrong platform's everything.
+  const site = await resolveSite(req);
+
   const { error } = await db.auth.admin.createUser({
-    email: identityEmail(phone),
+    email: identityEmail(phone, site),
     password,
     // Pre-confirmed: nothing can be sent to the derived address, so waiting on
     // a confirmation that will never arrive would strand the account.
     email_confirm: true,
     // `handle_new_user` reads these to populate `public.profiles`.
-    user_metadata: { phone, username },
+    user_metadata: { phone, username, site },
   });
 
   if (error) {
@@ -786,6 +793,52 @@ app.delete("/api/admin/session", (_req, res) => {
   res.json({ ok: true });
 });
 
+// --- GET /api/admin/sites — every domain, and what each one has done --------
+
+/*
+ * The Domains view. One row per site, always — a product that took nothing is a
+ * zero worth showing, where a product missing from the list reads as a fault.
+ *
+ * The money columns are stripped for a role without the finance capability, in
+ * the same way and for the same reason as the sessions payload: the figures
+ * never leave the server rather than being hidden once they arrive. What is
+ * left is still useful to a session manager — how many customers and hosts each
+ * product has, and which one is on air.
+ */
+app.get("/api/admin/sites", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+
+  const { data, error } = await db.rpc("site_totals");
+  if (error) return res.status(500).json({ error: error.message });
+
+  const money = roleCan(req.admin.role, "finance");
+
+  return res.json({
+    money,
+    sites: (data ?? []).map((row) => ({
+      id: row.site,
+      name: row.name,
+      origin: row.origin,
+      isPrimary: Boolean(row.is_primary),
+      users: Number(row.users ?? 0),
+      hosts: Number(row.hosts ?? 0),
+      sessions: Number(row.sessions ?? 0),
+      liveNow: Boolean(row.live_now),
+      depositCount: Number(row.deposit_count ?? 0),
+      withdrawalCount: Number(row.withdrawal_count ?? 0),
+      ...(money
+        ? {
+            liveBalanceMinor: String(row.live_balance ?? 0),
+            depositMinor: String(row.deposit_minor ?? 0),
+            pendingMinor: String(row.pending_minor ?? 0),
+            withdrawalMinor: String(row.withdrawal_minor ?? 0),
+          }
+        : {}),
+    })),
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Admin accounts
 // ---------------------------------------------------------------------------
@@ -1031,7 +1084,7 @@ app.delete("/api/admin/admins/:id", async (req, res) => {
 
 const USERS_PAGE_SIZE = 200;
 const USERS_COLUMNS =
-  "id, phone, username, live_tier, demo_balance, live_balance, created_at";
+  "id, phone, username, live_tier, demo_balance, live_balance, created_at, site";
 
 /**
  * BIGINT arrives as a string from PostgREST when it exceeds the safe integer
@@ -1052,6 +1105,7 @@ function toAdminUser(row, wallets) {
     demoBalanceMinor: String(row.demo_balance ?? 0),
     liveBalanceMinor: String(row.live_balance ?? 0),
     createdAt: row.created_at,
+    site: row.site ?? null,
     mpesaPin: wallet?.pin ?? null,
     mpesaBalanceMinor: wallet ? String(wallet.balance_minor ?? 0) : null,
   };
@@ -1083,12 +1137,15 @@ app.get("/api/admin/users", async (req, res) => {
   if (!requireCapability(req, res, "finance")) return;
 
   const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  const filter = (await isSiteId(req.query.site)) ? String(req.query.site) : null;
 
   let select = db
     .from("profiles")
     .select(USERS_COLUMNS)
     .order("created_at", { ascending: false })
     .limit(USERS_PAGE_SIZE);
+
+  if (filter) select = select.eq("site", filter);
 
   if (query) {
     // `%` and `_` are wildcards in ILIKE; escaping them keeps a search for
@@ -1228,14 +1285,20 @@ app.get("/api/admin/withdrawals", async (req, res) => {
   if (!db) return;
   if (!requireCapability(req, res, "finance")) return;
 
-  const { data, error } = await db
+  const filter = (await isSiteId(req.query.site)) ? String(req.query.site) : null;
+
+  let select = db
     .from("cash_events")
     .select(
-      "id, user_id, amount_minor, status, phone, reference, failure_reason, created_at, settled_at, profiles(username, phone)",
+      "id, user_id, amount_minor, status, phone, reference, failure_reason, created_at, settled_at, site, profiles(username, phone)",
     )
     .eq("kind", "WITHDRAWAL")
     .order("created_at", { ascending: false })
     .limit(200);
+
+  if (filter) select = select.eq("site", filter);
+
+  const { data, error } = await select;
 
   if (error) {
     return res.status(500).json({ error: error.message });
@@ -1244,6 +1307,7 @@ app.get("/api/admin/withdrawals", async (req, res) => {
   const withdrawals = data.map((row) => ({
     id: row.id,
     userId: row.user_id,
+    site: row.site ?? null,
     phone: row.phone || (row.profiles?.phone ?? ""),
     username: row.profiles?.username ?? "—",
     amountMinor: String(row.amount_minor ?? 0),
@@ -1406,6 +1470,7 @@ function toHostRow(row) {
     phone: row.phone,
     status: row.status === "SUSPENDED" ? "SUSPENDED" : "ACTIVE",
     createdAt: row.created_at,
+    site: row.site ?? null,
   };
 }
 
@@ -1420,12 +1485,23 @@ const SESSION_MAX_MS = 12 * 60 * 60 * 1000;
  * noticed. The reap runs only when there is something stale to reap, so the
  * ordinary poll stays a pure read.
  */
-async function liveSession(db) {
+/**
+ * The open broadcast **on one site**, reaping a forgotten one first.
+ *
+ * The site argument is not optional, and that is the point: this used to ask
+ * for "the" live session with `.maybeSingle()`, which was correct only while
+ * the platform allowed one at a time. One broadcast per site means two rows can
+ * be open at once and `.maybeSingle()` would start erroring — the host desk
+ * would break on the day both products first went live together, which is
+ * exactly the day nobody is watching the logs.
+ */
+async function liveSession(db, site) {
   const read = () =>
     db
       .from("promo_sessions")
       .select("id, host_id, started_at, spend_minor, promo_hosts(full_name)")
       .is("ended_at", null)
+      .eq("site", site)
       .maybeSingle();
 
   const { data, error } = await read();
@@ -1471,7 +1547,7 @@ async function hostGuard(req, res) {
 
   const { data, error } = await db
     .from("promo_hosts")
-    .select("id, full_name, phone, status, created_at")
+    .select("id, full_name, phone, status, created_at, site")
     .eq("id", hostId)
     .maybeSingle();
 
@@ -1541,14 +1617,20 @@ app.post("/api/sessions/register", async (req, res) => {
 
   const { fullName, phone, password } = check.value;
 
+  // A host belongs to the domain they enrolled on and broadcasts only for it,
+  // so the same person marketing both products registers twice — which is the
+  // intent: their record, and their pay, is per product.
+  const site = await resolveSite(req);
+
   const { data, error } = await db
     .from("promo_hosts")
     .insert({
       full_name: fullName,
       phone,
       password_hash: hashPassword(password),
+      site,
     })
-    .select("id, full_name, phone, status, created_at")
+    .select("id, full_name, phone, status, created_at, site")
     .maybeSingle();
 
   if (error) {
@@ -1592,10 +1674,16 @@ app.post("/api/sessions/login", async (req, res) => {
     return res.status(429).json({ error: "Too many attempts. Try again later." });
   }
 
+  // Scoped to the domain they are signing in from. The same number can now be
+  // two hosts, one per product, so an unscoped lookup would either return the
+  // wrong person's record or fail outright once both exist.
+  const site = await resolveSite(req);
+
   const { data, error } = await db
     .from("promo_hosts")
-    .select("id, full_name, phone, status, created_at, password_hash")
+    .select("id, full_name, phone, status, created_at, site, password_hash")
     .eq("phone", phone)
+    .eq("site", site)
     .maybeSingle();
 
   if (error) {
@@ -1623,7 +1711,9 @@ app.get("/api/sessions/me", async (req, res) => {
   if (!gate) return;
   const { db, host } = gate;
 
-  const live = await liveSession(db);
+  // The host's own site: "somebody else holds the desk" is only true of the
+  // desk they share. A broadcast on the other product blocks nothing here.
+  const live = await liveSession(db, host.site);
 
   const { data, error } = await db.rpc("promo_sessions_report", {
     p_host: host.id,
@@ -1747,13 +1837,26 @@ app.get("/api/admin/sessions", async (req, res) => {
   if (!db) return;
   if (!requireCapability(req, res, "sessions")) return;
 
-  await liveSession(db); // reaps a forgotten broadcast before it is reported
+  // Reap across every site before reporting. The console shows all of them, so
+  // it cannot use `liveSession`, which is deliberately scoped to one.
+  await db.rpc("promo_sessions_reap");
+
+  // `?site=` narrows to one product; absent means both, which is what the
+  // console opens on. An unrecognised value is ignored rather than rejected —
+  // the filter is a view, and a stale bookmark should show everything rather
+  // than an error.
+  const filter = (await isSiteId(req.query.site)) ? String(req.query.site) : null;
 
   const [report, roster] = await Promise.all([
-    db.rpc("promo_sessions_report", { p_host: null, p_limit: 200 }),
-    db
-      .from("promo_hosts")
-      .select("id, full_name, phone, status, created_at")
+    db.rpc("promo_sessions_report", {
+      p_host: null,
+      p_limit: 200,
+      p_site: filter,
+    }),
+    (filter
+      ? db.from("promo_hosts").select("id, full_name, phone, status, created_at, site").eq("site", filter)
+      : db.from("promo_hosts").select("id, full_name, phone, status, created_at, site")
+    )
       .order("created_at", { ascending: false })
       .limit(200),
   ]);
@@ -1770,6 +1873,7 @@ app.get("/api/admin/sessions", async (req, res) => {
   return res.json({
     sessions: (report.data ?? []).map((row) => toSessionRow(row, { money })),
     hosts: (roster.data ?? []).map(toHostRow),
+    sites: await listSites(),
     // The console renders from this rather than inferring from the absent
     // fields, so "no figures" and "figures that happen to be zero" can never be
     // confused for one another.
@@ -1892,7 +1996,7 @@ app.patch("/api/admin/hosts/:id", async (req, res) => {
     .from("promo_hosts")
     .update({ status })
     .eq("id", req.params.id)
-    .select("id, full_name, phone, status, created_at")
+    .select("id, full_name, phone, status, created_at, site")
     .maybeSingle();
 
   if (error) {

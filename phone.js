@@ -34,8 +34,35 @@ export function normalisePhone(input) {
  */
 const IDENTITY_DOMAIN = "meridian.invalid";
 
-export function identityEmail(normalisedPhone) {
-  return `${normalisedPhone}@${IDENTITY_DOMAIN}`;
+/**
+ * The site whose customers keep the untagged address.
+ *
+ * Every account that existed before the platform was split lives on this one,
+ * and their identity is already `254…@meridian.invalid` in `auth.users`. Tagging
+ * it now would mean none of them could ever sign in again, so the primary site
+ * is defined as "the one with no tag" and stays that way permanently.
+ */
+const UNTAGGED_SITE = "venti";
+
+/**
+ * The address carried as a Supabase Auth identity, for a phone number on a site.
+ *
+ * Supabase's `auth.users.email` is globally unique, so two products that each
+ * let the same person hold an account cannot both derive the same address from
+ * a phone number. The site therefore joins the *local part*:
+ *
+ *     venti   254712345678  ->  254712345678@meridian.invalid
+ *     candix  254712345678  ->  candix.254712345678@meridian.invalid
+ *
+ * The domain is untouched, and must stay untouched — see below.
+ *
+ * Passing no site yields the untagged form. That is the safe default: every
+ * caller that predates the split keeps working and keeps addressing the
+ * accounts it already created.
+ */
+export function identityEmail(normalisedPhone, site = UNTAGGED_SITE) {
+  const prefix = !site || site === UNTAGGED_SITE ? "" : `${site}.`;
+  return `${prefix}${normalisedPhone}@${IDENTITY_DOMAIN}`;
 }
 
 export const MIN_PASSWORD_LENGTH = 8;
