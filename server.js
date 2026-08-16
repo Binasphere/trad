@@ -839,6 +839,59 @@ app.get("/api/admin/sites", async (req, res) => {
   });
 });
 
+// --- GET /api/admin/overview — totals plus the daily series -----------------
+
+/*
+ * Everything the Overview page draws, in one round trip.
+ *
+ * Finance-only, unlike `/api/admin/sites`: this endpoint exists to chart money
+ * over time, and there is no version of it worth serving to a role that may not
+ * see money. A session manager's console never asks for it.
+ */
+app.get("/api/admin/overview", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const days = Math.max(7, Math.min(Number(req.query.days) || 30, 180));
+
+  const [totals, series] = await Promise.all([
+    db.rpc("site_totals"),
+    db.rpc("site_daily", { p_days: days }),
+  ]);
+
+  if (totals.error) return res.status(500).json({ error: totals.error.message });
+  if (series.error) return res.status(500).json({ error: series.error.message });
+
+  return res.json({
+    days,
+    sites: (totals.data ?? []).map((row) => ({
+      id: row.site,
+      name: row.name,
+      origin: row.origin,
+      isPrimary: Boolean(row.is_primary),
+      users: Number(row.users ?? 0),
+      hosts: Number(row.hosts ?? 0),
+      sessions: Number(row.sessions ?? 0),
+      liveNow: Boolean(row.live_now),
+      depositCount: Number(row.deposit_count ?? 0),
+      withdrawalCount: Number(row.withdrawal_count ?? 0),
+      liveBalanceMinor: String(row.live_balance ?? 0),
+      depositMinor: String(row.deposit_minor ?? 0),
+      pendingMinor: String(row.pending_minor ?? 0),
+      withdrawalMinor: String(row.withdrawal_minor ?? 0),
+    })),
+    daily: (series.data ?? []).map((row) => ({
+      day: row.day,
+      site: row.site,
+      depositMinor: String(row.deposit_minor ?? 0),
+      depositCount: Number(row.deposit_count ?? 0),
+      depositors: Number(row.depositors ?? 0),
+      signups: Number(row.signups ?? 0),
+    })),
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Admin accounts
 // ---------------------------------------------------------------------------
