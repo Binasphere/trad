@@ -32,6 +32,7 @@ const FALLBACK_SITES = [
   { id: "venti", origin: "https://ventitradingfx.com", name: "Venti", is_primary: true },
   { id: "candix", origin: "https://candixfx.com", name: "Candix FX", is_primary: false },
   { id: "barsfx", origin: "https://barsfx.com", name: "Bars FX", is_primary: false },
+  { id: "zbarfx", origin: "https://zbarfx.com", name: "Zbar FX", is_primary: false },
 ];
 
 let cache = { at: 0, sites: FALLBACK_SITES };
