@@ -70,6 +70,7 @@ import {
  *   PATCH /api/admin/users/:id           — change a user's live tier
  *   POST /api/admin/users/:id/password   — issue a temporary password
  *   GET/PATCH /api/admin/tickets[/:id]   — the support queue
+ *   GET/PATCH /api/admin/verifications   — ID + proof-of-address review
  *   GET  /api/admin/withdrawals          — the payout queue
  *   PATCH /api/admin/withdrawals/:id     — decide a pending request
  *   GET  /api/admin/sessions             — every promo broadcast, scored
@@ -1609,6 +1610,93 @@ app.patch("/api/admin/tickets/:id", async (req, res) => {
 
   const names = await usernamesFor(db, [data.user_id]);
   return res.json({ ticket: toAdminTicket(data, names) });
+});
+
+// --- GET /api/admin/verifications — documents awaiting review ---------------
+
+/**
+ * Each submission with short-lived signed links to its two files. The bucket
+ * is private; these links are minted per request and expire in ten minutes,
+ * so a copied URL stops working long before it could travel.
+ */
+const VERIFICATION_LINK_SECONDS = 600;
+
+app.get("/api/admin/verifications", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const status = ["PENDING", "APPROVED", "REJECTED"].includes(req.query.status)
+    ? req.query.status
+    : "PENDING";
+
+  const { data, error } = await db
+    .from("verifications")
+    .select("user_id, id_path, address_path, status, note, submitted_at, decided_at")
+    .eq("status", status)
+    .order("submitted_at", { ascending: true })
+    .limit(100);
+  if (error) return res.status(500).json({ error: error.message });
+
+  const ids = data.map((row) => row.user_id);
+  const { data: profiles } = ids.length
+    ? await db.from("profiles").select("id, username, phone, site").in("id", ids)
+    : { data: [] };
+  const byId = new Map((profiles ?? []).map((row) => [row.id, row]));
+
+  const bucket = db.storage.from("verification");
+  const sign = async (path) => {
+    const { data: signed } = await bucket.createSignedUrl(path, VERIFICATION_LINK_SECONDS);
+    return signed?.signedUrl ?? null;
+  };
+
+  const verifications = await Promise.all(
+    data.map(async (row) => {
+      const profile = byId.get(row.user_id);
+      return {
+        userId: row.user_id,
+        username: profile?.username ?? null,
+        phone: profile?.phone ?? null,
+        site: profile?.site ?? null,
+        status: row.status,
+        note: row.note,
+        submittedAt: row.submitted_at,
+        decidedAt: row.decided_at,
+        idUrl: await sign(row.id_path),
+        addressUrl: await sign(row.address_path),
+      };
+    }),
+  );
+
+  return res.json({ verifications });
+});
+
+// --- PATCH /api/admin/verifications/:userId — approve or reject --------------
+
+app.patch("/api/admin/verifications/:userId", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const body = parseBody(req) ?? {};
+  if (body.status !== "APPROVED" && body.status !== "REJECTED") {
+    return res.status(400).json({ error: "status must be APPROVED or REJECTED" });
+  }
+
+  const { data, error } = await db
+    .from("verifications")
+    .update({
+      status: body.status,
+      note: body.note ? String(body.note).slice(0, 500) : null,
+      decided_at: new Date().toISOString(),
+    })
+    .eq("user_id", req.params.userId)
+    .select("user_id, status")
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: "No such submission" });
+  return res.json({ ok: true, status: data.status });
 });
 
 // --- GET /api/admin/withdrawals — the payout queue --------------------------
