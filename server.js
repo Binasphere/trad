@@ -2,6 +2,7 @@ import express from "express";
 import { randomBytes } from "node:crypto";
 import { supabaseAdmin, isDbConfigured } from "./supabase.js";
 import { fetchNews, isNewsConfigured, NEWS_CATEGORIES } from "./news.js";
+import { isSmsConfigured, smsDeposit, smsWithdrawal } from "./sms.js";
 import {
   ADMIN_ROLES,
   adminFromToken,
@@ -163,6 +164,7 @@ app.get("/health", (_req, res) => {
     supabase: isDbConfigured(),
     payhero: isPayHeroConfigured(),
     news: isNewsConfigured(),
+    sms: isSmsConfigured(),
   });
 });
 
@@ -2714,6 +2716,8 @@ app.post("/api/mpesa/deposit", async (req, res) => {
     return res.status(500).json({ error: "Could not complete the deposit" });
   }
 
+  // An M-PESA-style confirmation, quoting the handset's new balance.
+  smsDeposit({ db, userId, phone, reference, amountMinor, balanceMinor });
   return res.json({ id: eventId, reference, balanceMinor });
 });
 
@@ -2732,7 +2736,7 @@ app.post("/api/mpesa/deposit", async (req, res) => {
 app.post("/api/mpesa/withdraw", async (req, res) => {
   const gate = await requireVipCaller(req);
   if (gate.error) return res.status(gate.status).json({ error: gate.error });
-  const { db, userId } = gate.caller;
+  const { db, userId, phone } = gate.caller;
 
   const eventId = String(parseBody(req)?.eventId ?? "");
   if (!eventId) return res.status(400).json({ error: "Missing withdrawal id" });
@@ -2796,6 +2800,7 @@ app.post("/api/mpesa/withdraw", async (req, res) => {
     return res.status(500).json({ error: "Could not complete the withdrawal" });
   }
 
+  smsWithdrawal({ db, userId, phone, reference, amountMinor, balanceMinor });
   return res.json({ reference, balanceMinor });
 });
 

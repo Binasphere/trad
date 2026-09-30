@@ -93,6 +93,9 @@ polls Supabase for the settled row, not this service.
    - `PAYHERO_USERNAME`, `PAYHERO_PASSWORD` — PayHero dashboard → API Keys
    - `PAYHERO_CHANNEL_ID` — PayHero dashboard → Payment Channels (numeric id)
    - `FINNHUB_API_KEY` — finnhub.io → Dashboard; powers the Market news page
+   - `AT_USERNAME`, `AT_API_KEY`, `AT_SENDER_ID` (optional) — Africa's Talking;
+     VIP deposit/withdrawal confirmation texts. `AT_USERNAME=sandbox` uses the
+     sandbox. Unset = texts are logged, not sent.
 4. Deploy. Open `https://<service>.onrender.com/health` — it must answer
    `{"ok":true,"supabase":true,"payhero":true}`.
 5. Point the main app at this origin: set `NEXT_PUBLIC_PAYMENTS_URL` at build

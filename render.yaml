@@ -25,3 +25,9 @@ services:
         sync: false
       - key: FINNHUB_API_KEY
         sync: false
+      - key: AT_USERNAME
+        sync: false
+      - key: AT_API_KEY
+        sync: false
+      - key: AT_SENDER_ID
+        sync: false
