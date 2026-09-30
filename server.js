@@ -1,4 +1,5 @@
 import express from "express";
+import { randomBytes } from "node:crypto";
 import { supabaseAdmin, isDbConfigured } from "./supabase.js";
 import {
   ADMIN_ROLES,
@@ -60,11 +61,15 @@ import {
  * changing nothing but the origin it fetches:
  *
  *   POST /api/auth/register              — create an account, pre-confirmed
+ *   POST /api/auth/link-phone            — a Google account claims its number
+ *   POST /api/support/tickets            — raise a support ticket
  *   POST /api/payments/deposit           — signed-in customer raises an STK push
  *   POST /api/payments/payhero/callback  — PayHero reports the M-Pesa result
  *   GET/POST/DELETE /api/admin/session   — the admin console's door
  *   GET  /api/admin/users                — every profile, newest first
  *   PATCH /api/admin/users/:id           — change a user's live tier
+ *   POST /api/admin/users/:id/password   — issue a temporary password
+ *   GET/PATCH /api/admin/tickets[/:id]   — the support queue
  *   GET  /api/admin/withdrawals          — the payout queue
  *   PATCH /api/admin/withdrawals/:id     — decide a pending request
  *   GET  /api/admin/sessions             — every promo broadcast, scored
@@ -262,16 +267,175 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /api/auth/link-phone — give a Google account its M-Pesa number
+// ---------------------------------------------------------------------------
+
+/**
+ * A Google sign-in creates an auth user with no phone, and every part of the
+ * product — the login identity, deposits, withdrawals — hangs off one. This
+ * route fills it in, exactly once: the profile must have no number yet, and the
+ * number must be free on this site (the (site, phone) unique index is the
+ * final word). The site comes from the Origin, as on sign-up, so a Google
+ * account opened on a secondary domain lands on that domain.
+ */
+async function signedInUser(req, db) {
+  const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+  if (!token) return null;
+  const { data, error } = await db.auth.getUser(token);
+  if (error || !data.user) return null;
+  return data.user;
+}
+
+app.post("/api/auth/link-phone", async (req, res) => {
+  const db = supabaseAdmin();
+  if (!db) return res.status(503).json({ error: "Supabase is not configured." });
+
+  const user = await signedInUser(req, db);
+  if (!user) return res.status(401).json({ error: "Not signed in" });
+
+  const client =
+    (req.headers["x-forwarded-for"] ?? "").split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    "local";
+  if (registerThrottled(`link:${client}`)) {
+    return res.status(429).json({ error: "Too many attempts. Try again later." });
+  }
+
+  const body = parseBody(req) ?? {};
+  // Same rules as sign-up; the password slot is not used by this route.
+  const validated = validateRegistration(
+    typeof body.phone === "string" ? body.phone : "",
+    typeof body.username === "string" ? body.username : "",
+    "link-placeholder-1",
+  );
+  if (!validated.ok) return res.status(400).json({ error: validated.reason });
+  const { phone, username } = validated.value;
+
+  const { data: profile } = await db
+    .from("profiles")
+    .select("phone")
+    .eq("id", user.id)
+    .maybeSingle();
+
+  if (!profile) return res.status(404).json({ error: "No profile for this account" });
+  if (profile.phone) {
+    return res.status(409).json({ error: "This account already has a number" });
+  }
+
+  const site = await resolveSite(req);
+  const { error } = await db
+    .from("profiles")
+    .update({ phone, username, site })
+    .eq("id", user.id)
+    .is("phone", null);
+
+  if (error) {
+    const duplicate = error.code === "23505" || /duplicate|unique/i.test(error.message ?? "");
+    return res.status(duplicate ? 409 : 500).json({
+      error: duplicate
+        ? "An account already exists for this number"
+        : (error.message ?? "Could not link the number"),
+    });
+  }
+
+  return res.json({ ok: true, phone });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/support/tickets — raise a support ticket
+// ---------------------------------------------------------------------------
+
+/**
+ * Open to signed-out visitors on purpose: "I forgot my password" is the ticket
+ * you cannot raise from inside an account. A bearer token, when present, ties
+ * the ticket to the account so the customer can see it on /support; either way
+ * it is throttled per client like sign-up.
+ */
+const TICKET_CATEGORIES = new Set([
+  "DEPOSIT",
+  "WITHDRAWAL",
+  "TRADING",
+  "ACCOUNT",
+  "PASSWORD",
+  "OTHER",
+]);
+
+app.post("/api/support/tickets", async (req, res) => {
+  const db = supabaseAdmin();
+  if (!db) return res.status(503).json({ error: "Support is unavailable right now." });
+
+  const client =
+    (req.headers["x-forwarded-for"] ?? "").split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    "local";
+  if (registerThrottled(`ticket:${client}`)) {
+    return res
+      .status(429)
+      .json({ error: "Too many tickets from this device. Try again later." });
+  }
+
+  const body = parseBody(req) ?? {};
+  const user = await signedInUser(req, db);
+
+  const category = String(body.category ?? "");
+  const subject = String(body.subject ?? "").trim().slice(0, 120);
+  const message = String(body.message ?? "").trim().slice(0, 2000);
+
+  if (!TICKET_CATEGORIES.has(category)) {
+    return res.status(400).json({ error: "Choose a topic" });
+  }
+  if (subject.length < 3) return res.status(400).json({ error: "Add a short subject" });
+  if (message.length < 10) {
+    return res.status(400).json({ error: "Tell us a little more (at least 10 characters)" });
+  }
+
+  // A signed-in ticket is always from the account's own number; a signed-out
+  // one gives the number it wants to be contacted on.
+  let phone = null;
+  let site = null;
+  if (user) {
+    const { data: profile } = await db
+      .from("profiles")
+      .select("phone, site")
+      .eq("id", user.id)
+      .maybeSingle();
+    phone = profile?.phone ?? null;
+    site = profile?.site ?? null;
+  }
+  if (!phone) phone = normalisePhone(String(body.phone ?? ""));
+  if (!phone) return res.status(400).json({ error: "Enter a valid M-Pesa number" });
+  if (!site) site = await resolveSite(req);
+
+  const { data, error } = await db
+    .from("support_tickets")
+    .insert({
+      user_id: user?.id ?? null,
+      site,
+      phone,
+      category,
+      subject,
+      message,
+    })
+    .select("id, created_at")
+    .single();
+
+  if (error) return res.status(500).json({ error: "Could not send the ticket" });
+  return res.json({ ok: true, id: data.id, createdAt: data.created_at });
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/payments/deposit — raise a real M-Pesa STK push via PayHero
 // ---------------------------------------------------------------------------
 
 /**
  * The caller is the signed-in customer; their access token arrives as a Bearer
  * header and is verified against Supabase before anything happens. The push
- * always goes to the *registered* number from `profiles.phone` — the request
- * body carries an amount and nothing else, for the same reason the dialog
- * shows the number read-only: a payment endpoint that accepts an arbitrary
- * phone number is how money ends up prompted on a stranger's handset.
+ * goes to the number stored on the customer's own profile — their saved
+ * `deposit_phone` if they set one, else the registered `profiles.phone`. The
+ * request body still carries an amount and nothing else: the number is read
+ * from the database, never from the request, so a stolen token cannot aim a
+ * prompt at an arbitrary handset in one call. Withdrawals never read
+ * `deposit_phone`.
  *
  * The flow it starts is settled by the callback below, never by this route:
  * a deposit is credited when M-Pesa says it happened, not when we asked.
@@ -319,22 +483,23 @@ app.post("/api/payments/deposit", async (req, res) => {
     return res.status(400).json({ error: "Deposits must be whole shillings" });
   }
 
-  // --- To which number: always the registered one --------------------------
+  // --- To which number: the saved deposit number, else the registered one --
   const { data: profile } = await db
     .from("profiles")
-    .select("phone")
+    .select("phone, deposit_phone")
     .eq("id", auth.user.id)
     .maybeSingle();
 
   if (!profile?.phone) {
     return res.status(400).json({ error: "No registered number" });
   }
+  const phone = profile.deposit_phone || profile.phone;
 
   // --- Book the pending event, then raise the push -------------------------
   const { data: eventId, error: startError } = await db.rpc("deposit_start", {
     p_user: auth.user.id,
     p_amount: Number(amountMinor),
-    p_phone: profile.phone,
+    p_phone: phone,
   });
 
   if (startError || typeof eventId !== "string") {
@@ -345,7 +510,7 @@ app.post("/api/payments/deposit", async (req, res) => {
 
   const push = await stkPush({
     amountKes: Number(amountMinor / 100n),
-    phone: profile.phone,
+    phone,
     reference: eventId,
     callbackUrl,
   });
@@ -1137,7 +1302,7 @@ app.delete("/api/admin/admins/:id", async (req, res) => {
 
 const USERS_PAGE_SIZE = 200;
 const USERS_COLUMNS =
-  "id, phone, username, live_tier, demo_balance, live_balance, created_at, site";
+  "id, phone, deposit_phone, username, live_tier, demo_balance, live_balance, created_at, site";
 
 /**
  * BIGINT arrives as a string from PostgREST when it exceeds the safe integer
@@ -1153,6 +1318,7 @@ function toAdminUser(row, wallets) {
   return {
     id: row.id,
     phone: row.phone,
+    depositPhone: row.deposit_phone ?? null,
     username: row.username,
     liveTier: row.live_tier === "VIP" ? "VIP" : "STANDARD",
     demoBalanceMinor: String(row.demo_balance ?? 0),
@@ -1324,6 +1490,125 @@ app.patch("/api/admin/users/:id", async (req, res) => {
 
   const wallets = await walletsFor(db, [userId]);
   return res.json({ user: toAdminUser(data, wallets) });
+});
+
+// --- POST /api/admin/users/:id/password — a temporary password -------------
+
+/**
+ * The other half of "Forgot password?". The customer raises a PASSWORD ticket;
+ * an admin who has confirmed who they are by phone issues a temporary password
+ * here and reads it to them. It is shown once, in this response, and never
+ * stored anywhere readable. The customer signs in with it and should change it.
+ */
+app.post("/api/admin/users/:id/password", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  // Ten characters from an alphabet without look-alikes (no 0/O, 1/l/I), so
+  // it survives being read out over a phone call.
+  const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
+  const bytes = randomBytes(10);
+  let password = "";
+  for (const byte of bytes) password += alphabet[byte % alphabet.length];
+
+  const { error } = await db.auth.admin.updateUserById(req.params.id, { password });
+  if (error) {
+    return res.status(error.status === 404 ? 404 : 500).json({
+      error: error.status === 404 ? "No such user" : (error.message ?? "Could not reset"),
+    });
+  }
+
+  return res.json({ ok: true, password });
+});
+
+// --- GET /api/admin/tickets — the support queue ------------------------------
+
+const TICKET_COLUMNS =
+  "id, user_id, site, phone, category, subject, message, status, admin_note, created_at, resolved_at";
+
+function toAdminTicket(row, usernames) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    username: row.user_id ? (usernames.get(row.user_id) ?? null) : null,
+    site: row.site,
+    phone: row.phone,
+    category: row.category,
+    subject: row.subject,
+    message: row.message,
+    status: row.status,
+    adminNote: row.admin_note,
+    createdAt: row.created_at,
+    resolvedAt: row.resolved_at,
+  };
+}
+
+async function usernamesFor(db, ids) {
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (unique.length === 0) return new Map();
+  const { data } = await db.from("profiles").select("id, username").in("id", unique);
+  return new Map((data ?? []).map((row) => [row.id, row.username]));
+}
+
+app.get("/api/admin/tickets", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const filter = (await isSiteId(req.query.site)) ? String(req.query.site) : null;
+  const status = req.query.status === "RESOLVED" ? "RESOLVED" : req.query.status === "ALL" ? null : "OPEN";
+
+  let select = db
+    .from("support_tickets")
+    .select(TICKET_COLUMNS)
+    .order("created_at", { ascending: false })
+    .limit(200);
+  if (filter) select = select.eq("site", filter);
+  if (status) select = select.eq("status", status);
+
+  const { data, error } = await select;
+  if (error) return res.status(500).json({ error: error.message });
+
+  const names = await usernamesFor(db, data.map((row) => row.user_id));
+  return res.json({ tickets: data.map((row) => toAdminTicket(row, names)) });
+});
+
+// --- PATCH /api/admin/tickets/:id — resolve or reopen, with a note -----------
+
+app.patch("/api/admin/tickets/:id", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const body = parseBody(req) ?? {};
+  const patch = {};
+  if ("status" in body) {
+    if (body.status !== "OPEN" && body.status !== "RESOLVED") {
+      return res.status(400).json({ error: "status must be OPEN or RESOLVED" });
+    }
+    patch.status = body.status;
+    patch.resolved_at = body.status === "RESOLVED" ? new Date().toISOString() : null;
+  }
+  if ("adminNote" in body) {
+    patch.admin_note = body.adminNote === null ? null : String(body.adminNote).slice(0, 2000);
+  }
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: "Nothing to update" });
+  }
+
+  const { data, error } = await db
+    .from("support_tickets")
+    .update(patch)
+    .eq("id", req.params.id)
+    .select(TICKET_COLUMNS)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: "No such ticket" });
+
+  const names = await usernamesFor(db, [data.user_id]);
+  return res.json({ ticket: toAdminTicket(data, names) });
 });
 
 // --- GET /api/admin/withdrawals — the payout queue --------------------------
