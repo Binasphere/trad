@@ -54,3 +54,18 @@ export async function fetchNews(category) {
   cache.set(category, { at: Date.now(), articles });
   return articles;
 }
+
+/** A one-quote probe: proves the key without spending the news cache. */
+export async function newsStatus() {
+  if (!isNewsConfigured()) return { ok: false, detail: "Not configured" };
+  const response = await fetch(
+    `https://finnhub.io/api/v1/quote?symbol=BINANCE:BTCUSDT&token=${encodeURIComponent(apiKey())}`,
+    { signal: AbortSignal.timeout(8000) },
+  );
+  if (response.status === 401 || response.status === 403) {
+    return { ok: false, detail: "Key refused" };
+  }
+  if (!response.ok) return { ok: false, detail: `HTTP ${response.status}` };
+  const body = await response.json().catch(() => null);
+  return { ok: true, detail: body?.c ? `BTC ${Number(body.c).toLocaleString("en-US")}` : "Reachable" };
+}

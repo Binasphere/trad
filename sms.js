@@ -25,39 +25,69 @@ export function isSmsConfigured() {
   return Boolean(username() && apiKey());
 }
 
-function endpoint() {
-  return username() === "sandbox"
-    ? "https://api.sandbox.africastalking.com/version1/messaging"
-    : "https://api.africastalking.com/version1/messaging";
+export function isSmsSandbox() {
+  return username() === "sandbox";
 }
 
-async function send(phone, message) {
+const host = () =>
+  isSmsSandbox() ? "https://api.sandbox.africastalking.com" : "https://api.africastalking.com";
+
+/**
+ * Sends one text. Resolves to what happened — never throws — so a caller that
+ * wants to show the provider's answer (the admin test) can, and one that does
+ * not (a deposit) can ignore it.
+ */
+export async function sendSms(phone, message) {
   if (!isSmsConfigured()) {
-    console.info("[sms] not configured; would have sent:", message);
-    return;
+    console.info(`[sms] not configured; would have sent to +${phone}: ${message}`);
+    return { sent: false, reason: "Africa's Talking is not configured" };
   }
 
-  const form = new URLSearchParams({
-    username: username(),
-    to: `+${phone}`,
-    message,
-  });
+  const form = new URLSearchParams({ username: username(), to: `+${phone}`, message });
   if (senderId()) form.set("from", senderId());
 
-  const response = await fetch(endpoint(), {
-    method: "POST",
-    headers: {
-      apiKey: apiKey(),
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: form,
-    signal: AbortSignal.timeout(10_000),
-  });
+  try {
+    const response = await fetch(`${host()}/version1/messaging`, {
+      method: "POST",
+      headers: {
+        apiKey: apiKey(),
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: form,
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body = await response.json().catch(() => null);
+    const recipient = body?.SMSMessageData?.Recipients?.[0] ?? null;
+    const ok = response.ok && (recipient?.statusCode === 100 || recipient?.statusCode === 101 || recipient?.status === "Success");
 
-  if (!response.ok) {
-    console.warn(`[sms] Africa's Talking answered ${response.status}`);
+    if (ok) console.info(`[sms] sent to +${phone} (${recipient?.messageId ?? "no id"})`);
+    else console.warn(`[sms] refused for +${phone}: ${recipient?.status ?? body?.SMSMessageData?.Message ?? response.status}`);
+
+    return {
+      sent: ok,
+      reason: ok ? null : String(recipient?.status ?? body?.SMSMessageData?.Message ?? `HTTP ${response.status}`),
+      provider: body?.SMSMessageData ?? null,
+    };
+  } catch (cause) {
+    console.warn(`[sms] could not reach Africa's Talking: ${cause?.message}`);
+    return { sent: false, reason: "Could not reach Africa's Talking" };
   }
+}
+
+/**
+ * The account's wallet balance at Africa's Talking — a real liveness check,
+ * since it proves the credentials as well as the connection.
+ */
+export async function smsAccountBalance() {
+  if (!isSmsConfigured()) return { ok: false, detail: "Not configured" };
+  const response = await fetch(`${host()}/version1/user?username=${encodeURIComponent(username())}`, {
+    headers: { apiKey: apiKey(), Accept: "application/json" },
+    signal: AbortSignal.timeout(8000),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, detail: `HTTP ${response.status}` };
+  return { ok: true, detail: `Balance ${body?.UserData?.balance ?? "unknown"}` };
 }
 
 // --- Formatting, the way the real texts read ---------------------------------
@@ -86,36 +116,34 @@ function when(date = new Date()) {
   };
 }
 
-async function brandFor(db, userId) {
-  const { data } = await db.from("profiles").select("site").eq("id", userId).maybeSingle();
+/** The exact text a VIP receives. Pure, so the console can preview it. */
+export function composeSms({ kind, brand, phone, reference, amountMinor, balanceMinor }) {
+  const { day, time } = when();
+  return kind === "DEPOSIT"
+    ? `${reference} Confirmed. Ksh${money(amountMinor)} sent to ${brand} for account ${phone} on ${day} at ${time}. New M-PESA balance is Ksh${money(balanceMinor)}. Transaction cost, Ksh0.00.`
+    : `${reference} Confirmed. You have received Ksh${money(amountMinor)} from ${brand} on ${day} at ${time}. New M-PESA balance is Ksh${money(balanceMinor)}.`;
+}
+
+export async function brandForSite(siteId) {
   const sites = await listSites();
-  const site = sites.find((s) => s.id === data?.site) ?? sites[0];
+  const site = sites.find((s) => s.id === siteId) ?? sites[0];
   return String(site?.name ?? "Venti").toUpperCase();
 }
 
-/**
- * Money left the handset for the trading account.
- * Fire-and-forget: callers do not await it.
- */
-export function smsDeposit({ db, userId, phone, reference, amountMinor, balanceMinor }) {
-  void (async () => {
-    const brand = await brandFor(db, userId);
-    const { day, time } = when();
-    await send(
-      phone,
-      `${reference} Confirmed. Ksh${money(amountMinor)} sent to ${brand} for account ${phone} on ${day} at ${time}. New M-PESA balance is Ksh${money(balanceMinor)}. Transaction cost, Ksh0.00.`,
-    );
-  })().catch((cause) => console.warn("[sms] deposit text failed:", cause?.message));
+async function brandFor(db, userId) {
+  const { data } = await db.from("profiles").select("site").eq("id", userId).maybeSingle();
+  return brandForSite(data?.site);
 }
 
-/** Money arrived on the handset from the trading account. */
-export function smsWithdrawal({ db, userId, phone, reference, amountMinor, balanceMinor }) {
+function notify(kind, { db, userId, phone, reference, amountMinor, balanceMinor }) {
   void (async () => {
     const brand = await brandFor(db, userId);
-    const { day, time } = when();
-    await send(
-      phone,
-      `${reference} Confirmed. You have received Ksh${money(amountMinor)} from ${brand} on ${day} at ${time}. New M-PESA balance is Ksh${money(balanceMinor)}.`,
-    );
-  })().catch((cause) => console.warn("[sms] withdrawal text failed:", cause?.message));
+    await sendSms(phone, composeSms({ kind, brand, phone, reference, amountMinor, balanceMinor }));
+  })().catch((cause) => console.warn(`[sms] ${kind.toLowerCase()} text failed: ${cause?.message}`));
 }
+
+/** Money left the handset for the trading account. Fire-and-forget. */
+export const smsDeposit = (input) => notify("DEPOSIT", input);
+
+/** Money arrived on the handset from the trading account. Fire-and-forget. */
+export const smsWithdrawal = (input) => notify("WITHDRAWAL", input);

@@ -132,3 +132,22 @@ export function callbackSucceeded(payload) {
     inner && (inner.ResultCode === 0 || inner.Status === "Success"),
   );
 }
+
+/**
+ * A read-only liveness probe: the service wallet's balance. Proves the
+ * credentials and the connection without moving money.
+ */
+export async function payHeroStatus() {
+  if (!isPayHeroConfigured()) return { ok: false, detail: "Not configured" };
+  const response = await fetch(
+    "https://backend.payhero.co.ke/api/v2/wallets?wallet_type=service_wallet",
+    { headers: { Authorization: basicAuth() }, signal: AbortSignal.timeout(8000) },
+  );
+  if (response.status === 401 || response.status === 403) {
+    return { ok: false, detail: "Credentials refused" };
+  }
+  if (!response.ok) return { ok: false, detail: `HTTP ${response.status}` };
+  const body = await response.json().catch(() => null);
+  const balance = body?.available_balance ?? body?.balance ?? body?.data?.available_balance;
+  return { ok: true, detail: balance !== undefined ? `Service wallet KSh ${balance}` : "Reachable" };
+}

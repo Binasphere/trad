@@ -1,8 +1,18 @@
 import express from "express";
+import { installLogBuffer, recentLogs } from "./logs.js";
 import { randomBytes } from "node:crypto";
 import { supabaseAdmin, isDbConfigured } from "./supabase.js";
-import { fetchNews, isNewsConfigured, NEWS_CATEGORIES } from "./news.js";
-import { isSmsConfigured, smsDeposit, smsWithdrawal } from "./sms.js";
+import { fetchNews, isNewsConfigured, NEWS_CATEGORIES, newsStatus } from "./news.js";
+import {
+  brandForSite,
+  composeSms,
+  isSmsConfigured,
+  isSmsSandbox,
+  sendSms,
+  smsAccountBalance,
+  smsDeposit,
+  smsWithdrawal,
+} from "./sms.js";
 import {
   ADMIN_ROLES,
   adminFromToken,
@@ -48,6 +58,7 @@ import {
   signCallback,
   stkPush,
   verifyCallback,
+  payHeroStatus,
 } from "./payhero.js";
 
 /**
@@ -74,6 +85,8 @@ import {
  *   GET/PATCH /api/admin/tickets[/:id]   — the support queue
  *   GET/PATCH /api/admin/verifications   — ID + proof-of-address review
  *   GET/POST /api/admin/chats[/:userId]  — live chat threads and replies
+ *   GET  /api/admin/system[/logs]        — service health, recent logs
+ *   POST /api/admin/system/sms-test      — preview or send a VIP text
  *   GET  /api/admin/withdrawals          — the payout queue
  *   PATCH /api/admin/withdrawals/:id     — decide a pending request
  *   GET  /api/admin/sessions             — every promo broadcast, scored
@@ -86,6 +99,9 @@ import {
  *   GET  /health                         — Render's health check; also shows
  *                                          which secrets are still missing
  */
+
+// Keep the recent log lines for the console's System page.
+installLogBuffer();
 
 const app = express();
 app.disable("x-powered-by");
@@ -1833,6 +1849,135 @@ app.post("/api/admin/chats/:userId", async (req, res) => {
   return res.json({
     message: { id: data.id, sender: data.sender, body: data.body, createdAt: data.created_at },
   });
+});
+
+// --- System: health, logs and live tests -------------------------------------
+
+const STARTED_AT = Date.now();
+
+/** Runs one probe with a stopwatch; a throw is a failure, not a 500. */
+async function probe(fn) {
+  const started = Date.now();
+  try {
+    const result = await fn();
+    return { ...result, ms: Date.now() - started };
+  } catch (cause) {
+    return { ok: false, detail: cause?.message ?? "Failed", ms: Date.now() - started };
+  }
+}
+
+app.get("/api/admin/system", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const [database, mpesaRail, lastDeposit, payhero, sms, news] = await Promise.all([
+    probe(async () => {
+      const { error } = await db.from("profiles").select("id", { head: true, count: "exact" }).limit(1);
+      return error ? { ok: false, detail: error.message } : { ok: true, detail: "Supabase answering" };
+    }),
+    probe(async () => {
+      const { count, error } = await db
+        .from("mpesa_demo_wallet")
+        .select("user_id", { head: true, count: "exact" });
+      return error
+        ? { ok: false, detail: "Wallet table missing — run mpesa-demo.sql" }
+        : { ok: true, detail: `${count ?? 0} VIP handset${count === 1 ? "" : "s"} set up` };
+    }),
+    db
+      .from("cash_events")
+      .select("settled_at")
+      .eq("kind", "DEPOSIT")
+      .eq("status", "COMPLETED")
+      .order("settled_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then(({ data }) => data?.settled_at ?? null, () => null),
+    probe(payHeroStatus),
+    probe(async () => {
+      const status = await smsAccountBalance();
+      return isSmsSandbox() && status.ok ? { ...status, detail: `Sandbox · ${status.detail}` } : status;
+    }),
+    probe(newsStatus),
+  ]);
+
+  return res.json({
+    services: [
+      { id: "database", name: "Database", ...database },
+      {
+        id: "mpesa",
+        name: "M-Pesa (PayHero)",
+        ...payhero,
+        extra: lastDeposit ? `Last deposit ${lastDeposit}` : "No completed deposit yet",
+      },
+      { id: "mpesaRail", name: "VIP M-PESA rail", ...mpesaRail },
+      { id: "sms", name: "Africa's Talking", ...sms },
+      { id: "news", name: "Market news (Finnhub)", ...news },
+      {
+        id: "admin",
+        name: "Admin auth",
+        ok: isAdminEnabled(),
+        detail: isAdminEnabled() ? "AUTH_SECRET set" : "AUTH_SECRET missing",
+        ms: 0,
+      },
+    ],
+    service: {
+      startedAt: new Date(STARTED_AT).toISOString(),
+      uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
+      node: process.version,
+      commit: (process.env.RENDER_GIT_COMMIT || "").slice(0, 7) || null,
+    },
+  });
+});
+
+app.get("/api/admin/system/logs", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+  const level = ["info", "warn", "error"].includes(req.query.level) ? req.query.level : "all";
+  return res.json({ logs: recentLogs(level) });
+});
+
+/**
+ * The VIP confirmation text, exactly as a customer would get it. `send: false`
+ * only previews; `send: true` also delivers it through Africa's Talking and
+ * returns the provider's answer. Amounts are the admin's to choose — nothing
+ * here touches a wallet.
+ */
+app.post("/api/admin/system/sms-test", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const body = parseBody(req) ?? {};
+  const phone = normalisePhone(String(body.phone ?? ""));
+  if (!phone) return res.status(400).json({ error: "Enter a valid Kenyan number" });
+
+  const kind = body.kind === "DEPOSIT" ? "DEPOSIT" : "WITHDRAWAL";
+  const amountMinor = Math.round(Number(body.amountMinor));
+  const balanceMinor = Math.round(Number(body.balanceMinor));
+  if (!Number.isFinite(amountMinor) || amountMinor <= 0) {
+    return res.status(400).json({ error: "Enter an amount" });
+  }
+  if (!Number.isFinite(balanceMinor) || balanceMinor < 0) {
+    return res.status(400).json({ error: "Enter a balance" });
+  }
+
+  const brand = await brandForSite(typeof body.site === "string" ? body.site : null);
+  const message = composeSms({
+    kind,
+    brand,
+    phone,
+    reference: demoReference(),
+    amountMinor,
+    balanceMinor,
+  });
+
+  if (!body.send) return res.json({ message, sent: false, preview: true });
+
+  console.info(`[system] test ${kind.toLowerCase()} text to +${phone} by an admin`);
+  const result = await sendSms(phone, message);
+  return res.json({ message, ...result });
 });
 
 // --- GET /api/admin/withdrawals — the payout queue --------------------------
