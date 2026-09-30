@@ -31,3 +31,7 @@ services:
         sync: false
       - key: AT_SENDER_ID
         sync: false
+      - key: SMS_LINK
+        sync: false
+      - key: SMS_DAILY_LIMIT_KES
+        sync: false
