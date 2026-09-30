@@ -92,6 +92,7 @@ polls Supabase for the settled row, not this service.
    - `ADMIN_PASSCODE` — the admin console's door; unset = admin API off
    - `PAYHERO_USERNAME`, `PAYHERO_PASSWORD` — PayHero dashboard → API Keys
    - `PAYHERO_CHANNEL_ID` — PayHero dashboard → Payment Channels (numeric id)
+   - `FINNHUB_API_KEY` — finnhub.io → Dashboard; powers the Market news page
 4. Deploy. Open `https://<service>.onrender.com/health` — it must answer
    `{"ok":true,"supabase":true,"payhero":true}`.
 5. Point the main app at this origin: set `NEXT_PUBLIC_PAYMENTS_URL` at build

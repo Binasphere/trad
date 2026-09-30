@@ -1,6 +1,7 @@
 import express from "express";
 import { randomBytes } from "node:crypto";
 import { supabaseAdmin, isDbConfigured } from "./supabase.js";
+import { fetchNews, isNewsConfigured, NEWS_CATEGORIES } from "./news.js";
 import {
   ADMIN_ROLES,
   adminFromToken,
@@ -79,6 +80,7 @@ import {
  *   POST /api/sessions/register|login    — the promo host's own door
  *   GET  /api/sessions/me                — host, live broadcast, history
  *   POST /api/sessions/start|end         — open and close a broadcast
+ *   GET  /api/news                       — market news (Finnhub), cached
  *   GET  /health                         — Render's health check; also shows
  *                                          which secrets are still missing
  */
@@ -160,7 +162,26 @@ app.get("/health", (_req, res) => {
     ok: isDbConfigured() && isPayHeroConfigured(),
     supabase: isDbConfigured(),
     payhero: isPayHeroConfigured(),
+    news: isNewsConfigured(),
   });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/news?category=crypto — market news, via Finnhub
+// ---------------------------------------------------------------------------
+
+app.get("/api/news", async (req, res) => {
+  if (!isNewsConfigured()) {
+    return res.status(503).json({ error: "News is not configured" });
+  }
+  const category = NEWS_CATEGORIES.has(req.query.category) ? req.query.category : "crypto";
+  try {
+    const articles = await fetchNews(category);
+    res.setHeader("cache-control", "public, max-age=120");
+    return res.json({ articles });
+  } catch {
+    return res.status(502).json({ error: "News is unavailable right now" });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -247,7 +268,16 @@ app.post("/api/auth/register", async (req, res) => {
     // a confirmation that will never arrive would strand the account.
     email_confirm: true,
     // `handle_new_user` reads these to populate `public.profiles`.
-    user_metadata: { phone, username, site },
+    // `ref` is a referral code; `handle_new_user` resolves it to the referrer
+    // and ignores one that matches nobody.
+    user_metadata: {
+      phone,
+      username,
+      site,
+      ...(typeof body.ref === "string" && /^[A-Za-z0-9]{4,12}$/.test(body.ref)
+        ? { ref: body.ref.toUpperCase() }
+        : {}),
+    },
   });
 
   if (error) {
@@ -324,9 +354,22 @@ app.post("/api/auth/link-phone", async (req, res) => {
   }
 
   const site = await resolveSite(req);
+
+  // A referral code carried through the Google round trip, if it names
+  // someone other than this account.
+  let referredBy;
+  if (typeof body.ref === "string" && /^[A-Za-z0-9]{4,12}$/.test(body.ref)) {
+    const { data: referrer } = await db
+      .from("profiles")
+      .select("id")
+      .eq("referral_code", body.ref.toUpperCase())
+      .maybeSingle();
+    if (referrer && referrer.id !== user.id) referredBy = referrer.id;
+  }
+
   const { error } = await db
     .from("profiles")
-    .update({ phone, username, site })
+    .update({ phone, username, site, ...(referredBy ? { referred_by: referredBy } : {}) })
     .eq("id", user.id)
     .is("phone", null);
 

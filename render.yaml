@@ -23,3 +23,5 @@ services:
         sync: false
       - key: PAYHERO_CHANNEL_ID
         sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
