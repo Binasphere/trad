@@ -73,6 +73,7 @@ import {
  *   POST /api/admin/users/:id/password   — issue a temporary password
  *   GET/PATCH /api/admin/tickets[/:id]   — the support queue
  *   GET/PATCH /api/admin/verifications   — ID + proof-of-address review
+ *   GET/POST /api/admin/chats[/:userId]  — live chat threads and replies
  *   GET  /api/admin/withdrawals          — the payout queue
  *   PATCH /api/admin/withdrawals/:id     — decide a pending request
  *   GET  /api/admin/sessions             — every promo broadcast, scored
@@ -1742,6 +1743,96 @@ app.patch("/api/admin/verifications/:userId", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: "No such submission" });
   return res.json({ ok: true, status: data.status });
+});
+
+// --- Live chat: conversations, a thread, a reply ---------------------------
+
+/**
+ * One conversation per customer. The list is built from the most recent
+ * messages rather than a conversations table: there is nothing to keep in
+ * step, and the newest line of each thread is exactly what the list shows.
+ */
+app.get("/api/admin/chats", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const { data, error } = await db
+    .from("chat_messages")
+    .select("user_id, sender, body, created_at, read_at")
+    .order("created_at", { ascending: false })
+    .limit(1000);
+  if (error) return res.status(500).json({ error: error.message });
+
+  const threads = new Map();
+  for (const row of data) {
+    let thread = threads.get(row.user_id);
+    if (!thread) {
+      thread = { userId: row.user_id, last: row.body, lastSender: row.sender, lastAt: row.created_at, unread: 0 };
+      threads.set(row.user_id, thread);
+    }
+    if (row.sender === "CUSTOMER" && !row.read_at) thread.unread += 1;
+  }
+
+  const ids = [...threads.keys()];
+  const { data: profiles } = ids.length
+    ? await db.from("profiles").select("id, username, phone").in("id", ids)
+    : { data: [] };
+  const byId = new Map((profiles ?? []).map((p) => [p.id, p]));
+
+  return res.json({
+    chats: [...threads.values()].map((t) => ({
+      ...t,
+      username: byId.get(t.userId)?.username ?? null,
+      phone: byId.get(t.userId)?.phone ?? null,
+    })),
+  });
+});
+
+app.get("/api/admin/chats/:userId", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const { data, error } = await db
+    .from("chat_messages")
+    .select("id, sender, body, created_at")
+    .eq("user_id", req.params.userId)
+    .order("created_at", { ascending: true })
+    .limit(500);
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Opening a thread reads it.
+  await db
+    .from("chat_messages")
+    .update({ read_at: new Date().toISOString() })
+    .eq("user_id", req.params.userId)
+    .eq("sender", "CUSTOMER")
+    .is("read_at", null);
+
+  return res.json({
+    messages: data.map((m) => ({ id: m.id, sender: m.sender, body: m.body, createdAt: m.created_at })),
+  });
+});
+
+app.post("/api/admin/chats/:userId", async (req, res) => {
+  const db = await adminGuard(req, res);
+  if (!db) return;
+  if (!requireCapability(req, res, "finance")) return;
+
+  const text = String(parseBody(req)?.body ?? "").trim().slice(0, 2000);
+  if (!text) return res.status(400).json({ error: "Type a reply" });
+
+  const { data, error } = await db
+    .from("chat_messages")
+    .insert({ user_id: req.params.userId, sender: "AGENT", body: text })
+    .select("id, sender, body, created_at")
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  return res.json({
+    message: { id: data.id, sender: data.sender, body: data.body, createdAt: data.created_at },
+  });
 });
 
 // --- GET /api/admin/withdrawals — the payout queue --------------------------
