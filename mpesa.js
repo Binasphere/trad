@@ -55,10 +55,25 @@ export class NoDemoWallet extends Error {
 
 const CODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-/** An M-Pesa-shaped receipt, e.g. `TIL4KX92MB`. */
+const REFERENCE_LENGTH = 10;
+
+/**
+ * The fixed start of every reference, from REFERENCE_PREFIX (up to 4 letters
+ * or digits, uppercased). Unset or invalid falls back to "T". Changing it in
+ * env changes new codes only, so any copied code gives away when it was made.
+ */
+function referencePrefix() {
+  const prefix = String(process.env.REFERENCE_PREFIX ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 4);
+  return prefix || "T";
+}
+
+/** An M-Pesa-shaped receipt, e.g. `TIL4KX92MB` — the prefix, then random. */
 export function demoReference() {
-  let out = "T";
-  for (let i = 0; i < 9; i++) {
+  let out = referencePrefix();
+  while (out.length < REFERENCE_LENGTH) {
     out += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
   }
   return out;
